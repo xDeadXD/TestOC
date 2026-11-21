@@ -1,6 +1,6 @@
 # TestOC
 
-High-resolution desktop hardware stability testing and system telemetry suite for Windows, published by **xDead**. Built with **Tauri v2 (Rust)**, **React + TypeScript + Tailwind CSS v4**, **`uPlot` Canvas charting**, **`wgpu` (Vulkan)** GPU compute/3D workloads, and a read-only **LibreHardwareMonitor (.NET 8)** sensor sidecar.
+High-resolution desktop hardware stability testing and system telemetry suite for Windows. Built with **Tauri v2 (Rust)**, **React + TypeScript + Tailwind CSS v4**, **`uPlot` Canvas charting**, **`wgpu` (Vulkan)** GPU compute/3D workloads, and a read-only **LibreHardwareMonitor (.NET 8)** sensor sidecar.
 
 Designed to expose even `0.001%` marginal CPU, IMC, DRAM, GPU, and GDDR overclock instabilities with zero subjective heuristics — every stress kernel performs mathematically deterministic verification.
 
