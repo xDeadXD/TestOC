@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/binaries/*.exe
+src-tauri/nsis/PawnIO_setup.exe
+src-tauri/gen/
+sensors-sidecar/bin/
+sensors-sidecar/obj/
+sensors-sidecar/publish/
+test-results/
+playwright-report/
+.env.local
+*.local
+*.log

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TestOC",
+  "version": "0.1.0",
+  "identifier": "com.xdead.testoc",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:all",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TestOC",
+        "width": 1480,
+        "height": 940,
+        "minWidth": 1100,
+        "minHeight": 720,
+        "backgroundColor": "#0b0f14"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "publisher": "xDead",
+    "targets": ["nsis"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "externalBin": ["binaries/testoc-sensors"],
+    "resources": {
+      "nsis/PawnIO_setup.exe": "resources/PawnIO_setup.exe"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "./nsis/hooks.nsh"
+      }
+    }
+  }
+}

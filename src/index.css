@@ -1,0 +1,65 @@
+@import "tailwindcss";
+@import "uplot/dist/uPlot.min.css";
+
+@theme {
+  --color-ink-950: #090d12;
+  --color-ink-900: #0f151e;
+  --color-ink-850: #141c27;
+  --color-ink-800: #1b2534;
+  --color-ink-700: #28364a;
+  --color-ink-600: #394b66;
+  --color-accent: #ff5a36;
+  --color-accent-dim: #c94122;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    background-color: var(--color-ink-950);
+    color: #e2e8f0;
+    font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Dark uPlot overrides */
+.uplot {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+  color: #94a3b8;
+}
+.u-legend {
+  font-size: 11px !important;
+  text-align: left !important;
+  padding: 4px 2px 0 !important;
+  line-height: 1.35 !important;
+}
+.u-legend .u-series {
+  margin-right: 10px !important;
+}
+.u-legend .u-marker {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 2px !important;
+}
+
+/* Subtle dark scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0b1017;
+}
+::-webkit-scrollbar-thumb {
+  background: #243244;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #354963;
+}
