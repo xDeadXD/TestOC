@@ -1,6 +1,6 @@
 [package]
 name = "testoc"
-version = "0.1.0"
+version = "0.1.1"
 description = "High-resolution hardware stability testing and telemetry suite"
 authors = ["xDead"]
 edition = "2021"

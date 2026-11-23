@@ -37,7 +37,7 @@ export function TopBar() {
             <div className="flex items-center gap-2">
               <span className="text-sm font-bold tracking-wide text-white">TESTOC</span>
               <span className="rounded bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
-                v{info?.appVersion ?? "0.1.0"}
+                v{info?.appVersion ?? "0.1.1"}
               </span>
               <span className="text-[10px] text-slate-500">by xDead</span>
             </div>

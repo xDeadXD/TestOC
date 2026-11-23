@@ -35,7 +35,7 @@ declare global {
 const GB = 1024 ** 3;
 
 const MOCK_INFO: SystemInfo = {
-  appVersion: "0.1.0-mock",
+  appVersion: "0.1.1-mock",
   hostname: "TESTOC-MOCK",
   osVersion: "Windows 11 Pro (Mock)",
   cpuBrand: "Demo 8-Core x86_64 Processor",
