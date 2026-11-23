@@ -270,11 +270,25 @@ test.describe("TestOC Dashboard (Mock IPC)", () => {
     await expect(page.getByTestId("mem-pct-slider")).toHaveValue("100");
     await expect(page.getByTestId("mem-profile-absolut")).toBeVisible();
     await expect(page.getByTestId("mem-profile-standard")).toBeVisible();
+    await expect(page.getByTestId("stress-panel")).not.toContainText("16 GiB");
     await page.getByTestId("mem-cycles-3").click();
     await expect(page.getByTestId("match-ram-cap-btn")).toBeHidden();
     await page.getByTestId("start-stress-btn").click();
     await expect(page.getByTestId("allocated-bytes-tile")).toBeVisible();
     await expect(page.getByTestId("stress-live-stage")).toContainText("Absolut C1/3");
+    await expect(page.getByTestId("stress-live-stage")).toContainText("T1");
+    // Verify hardware RAM mismatch updates error counter and renders live inline error log immediately
+    await page.evaluate(() => {
+      window.__TESTOC_MOCK__?.emitError({
+        workerId: 0,
+        coreId: null,
+        kind: "memoryMismatch",
+        detail: "Absolut C1 T1 p1/36: 1 word(s) mismatched (chunk 0, offset 6216 B, diff=0x0000080000000000)",
+        timestampMs: Date.now(),
+      });
+    });
+    await expect(page.getByTestId("error-counter")).toContainText("1");
+    await expect(page.getByTestId("worker-error-log")).toContainText("Absolut C1 T1");
     const memAbsCall = await page.evaluate(() =>
       window.__TESTOC_MOCK__?.calls.find(
         (c) => c.cmd === "start_stress" && ((c.args as { config?: { kind?: string } })?.config?.kind === "memory")

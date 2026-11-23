@@ -163,11 +163,19 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
           if (needsTerminalSync) {
             reconcile = true;
           }
+          const syncedStress =
+            cur == null
+              ? cur
+              : needsTerminalSync
+                ? { ...cur, phase: s.stress.phase, workersAlive: 0, totalErrors: Math.max(cur.totalErrors, s.stress.errors) }
+                : s.stress.errors > cur.totalErrors
+                  ? { ...cur, totalErrors: s.stress.errors }
+                  : cur;
           return {
             latest: s,
             sampleCount: st.sampleCount + 1,
             session: st.session?.recording ? { ...st.session, samples: st.session.samples + 1 } : st.session,
-            stress: needsTerminalSync && cur ? { ...cur, phase: s.stress.phase, workersAlive: 0 } : cur,
+            stress: syncedStress,
           };
         });
         if (reconcile) {
@@ -184,7 +192,13 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
         }
       },
       onStressError: (e) => {
-        set((st) => ({ workerErrors: [e, ...st.workerErrors].slice(0, 100) }));
+        set((st) => ({
+          workerErrors: [e, ...st.workerErrors].slice(0, 100),
+          stress:
+            st.stress && e.kind !== "allocFailed" && e.kind !== "gpuDevice"
+              ? { ...st.stress, totalErrors: Math.max(st.stress.totalErrors, st.workerErrors.length + 1) }
+              : st.stress,
+        }));
       },
       onAlert: (a) => {
         set((st) => ({
@@ -224,7 +238,7 @@ export const useTelemetryStore = create<TelemetryStore>((set, get) => ({
     try {
       const stress = await ipc.startStress(config, ackNoThermal);
       const session = await ipc.getSessionInfo();
-      set({ stress, session, noThermalConfig: null });
+      set({ stress, session, noThermalConfig: null, workerErrors: [], bannerAlert: null });
     } catch (e) {
       if (isAppError(e) && e.code === "thermalUnavailable") {
         set({ noThermalConfig: config });

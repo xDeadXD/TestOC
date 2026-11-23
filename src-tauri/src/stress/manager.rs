@@ -107,6 +107,7 @@ pub struct RunShared {
     rate: Mutex<RateState>,
     message: Mutex<Option<String>>,
     err_window: AtomicU64, // (second << 16) | count
+    first_hw_error_announced: AtomicBool,
 }
 
 impl RunShared {
@@ -300,13 +301,20 @@ impl RunShared {
                 worker_id: worker_id as u16,
                 core_id: core_id.map(|c| c as u16),
                 kind,
-                detail,
+                detail: detail.clone(),
                 timestamp_ms: now_ms(),
             });
+            // Push updated error count to the UI immediately instead of waiting for the 1 s supervisor tick.
+            if is_hw_err {
+                events.status(&self.status());
+            }
         }
         let errs = self.total_errors();
+        let mut aborted_now = false;
         if let Some(cut) = self.error_cutoff {
             if is_hw_err && errs >= cut && self.trigger_abort(AbortReason::WorkerError) {
+                aborted_now = true;
+                self.first_hw_error_announced.store(true, Ordering::Relaxed);
                 events.alert(&SafetyAlert {
                     level: AlertLevel::Critical,
                     metric: AlertMetric::WorkerError,
@@ -315,12 +323,27 @@ impl RunShared {
                     action: AlertAction::Aborted,
                     timestamp_ms: now_ms(),
                     message: if cut == 1 {
-                        "Hardware error detected; stopped on first error".into()
+                        format!("Hardware error detected; stopped on first error ({detail})")
                     } else {
                         format!("Hardware error limit reached ({errs} ≥ {cut}); test aborted")
                     },
                 });
+                events.status(&self.status());
             }
+        }
+        // Surface the first hardware error immediately as a Critical banner even when stop-on-error is off.
+        if is_hw_err && !aborted_now && !self.first_hw_error_announced.swap(true, Ordering::AcqRel)
+        {
+            events.alert(&SafetyAlert {
+                level: AlertLevel::Critical,
+                metric: AlertMetric::WorkerError,
+                value: errs as f32,
+                threshold: 1.0,
+                action: AlertAction::None,
+                timestamp_ms: now_ms(),
+                message: format!("Hardware error detected: {detail}"),
+            });
+            events.status(&self.status());
         }
     }
 
@@ -770,6 +793,7 @@ impl StressManager {
             rate: Mutex::new(RateState::default()),
             message: Mutex::new(None),
             err_window: AtomicU64::new(0),
+            first_hw_error_announced: AtomicBool::new(false),
         });
 
         // Spawn workers.
@@ -839,11 +863,22 @@ impl StressManager {
             });
             for w in 0..mem_threads as usize {
                 let (s, ev, co) = (shared.clone(), self.events.clone(), coord.clone());
+                let pin_core = (kind == StressKind::Memory && logical > 0).then_some(w % logical);
                 s.workers_alive.fetch_add(1, Ordering::SeqCst);
                 match spawn(
                     format!("mem-worker-{w}"),
                     Box::new(move || {
-                        mem_worker(s, ev, w, per, mem_profile, mem_pattern, mem_cycles, co)
+                        mem_worker(
+                            s,
+                            ev,
+                            w,
+                            pin_core,
+                            per,
+                            mem_profile,
+                            mem_pattern,
+                            mem_cycles,
+                            co,
+                        )
                     }),
                 ) {
                     Ok(h) => handles.push(h),
@@ -1555,6 +1590,7 @@ fn mem_worker(
     shared: Arc<RunShared>,
     events: Arc<dyn StressEvents>,
     worker: usize,
+    pin_core: Option<usize>,
     bytes: u64,
     profile: MemoryProfile,
     pattern_pref: MemoryPattern,
@@ -1563,6 +1599,9 @@ fn mem_worker(
 ) {
     let _alive = AliveGuard(&shared);
     win::set_current_thread_below_normal();
+    if let Some(core) = pin_core {
+        win::pin_current_thread(core);
+    }
     let mut alloc = AllocatedChunks {
         shared: &shared,
         chunks: Vec::new(),
@@ -1570,13 +1609,15 @@ fn mem_worker(
         bytes: 0,
     };
 
-    // Stage 1: Commit initial physical RAM target in parallel across workers.
+    // Stage 1: Commit initial physical RAM target in parallel across workers (ensuring >= 2 disjoint
+    // chunks per worker so cross-chunk R<->W turnarounds & opposing-end MirrorMove bypass L3 cache).
+    let chunk_cap = mk::worker_chunk_bytes(bytes);
     let mut remaining = bytes as usize;
     while remaining > 0 {
         if !shared.should_continue() {
             return;
         }
-        let words = (remaining.min(mk::CHUNK_BYTES) / 8).max(1);
+        let words = (remaining.min(chunk_cap) / 8).max(1);
         match mk::try_alloc_chunk(words) {
             Some(c) => {
                 alloc.push(c);
@@ -1606,7 +1647,7 @@ fn mem_worker(
         }
     }
 
-    // Stage 2: Reclaim trimmed OS standby cache across short waves right after Stage 1.
+    // Stage 2: Fast standby-cache reclamation (2 short waves so T1 begins hammering DRAM in < 0.5 s).
     coord.stage1_done.fetch_add(1, Ordering::AcqRel);
     if coord.target_pct.min(coord.max_pct) >= 50 {
         while (coord.stage1_done.load(Ordering::Acquire) as usize) < coord.total_workers {
@@ -1618,12 +1659,12 @@ fn mem_worker(
         if worker == 0 {
             win::hint_working_set_bytes(shared.mem_allocated.load(Ordering::Relaxed));
         }
-        for wave in 0..5 {
+        for wave in 0..2 {
             if !shared.should_continue() {
                 break;
             }
             sleep_check(
-                Duration::from_millis(if wave == 0 { 80 } else { 60 }),
+                Duration::from_millis(if wave == 0 { 40 } else { 30 }),
                 &shared,
             );
             let (added, _) = reclaim_free_ram(&shared, &coord, &mut alloc, 64);
@@ -1700,6 +1741,29 @@ fn mem_worker(
                             mk::absolut_test_name(test_id)
                         ));
                     }
+                    let on_error = |bad: u64, mm: mk::MemMismatch| {
+                        // Add remaining mismatches before record_error so total_errors and error_cutoff see exact count.
+                        if bad > 1 {
+                            shared.total_errors.fetch_add(bad - 1, Ordering::Relaxed);
+                        }
+                        let detail = format!(
+                            "Absolut C{cycle} T{test_id} p{}/{total_sub} ({}): {bad} word(s) mismatched (chunk {}, offset {} B, exp=0x{:016X}, got=0x{:016X}, diff=0x{:016X})",
+                            sub_pass + 1,
+                            mk::absolut_test_name(test_id),
+                            mm.chunk_idx,
+                            mm.word_idx * 8,
+                            mm.expected,
+                            mm.actual,
+                            mm.expected ^ mm.actual
+                        );
+                        shared.record_error(
+                            &*events,
+                            worker,
+                            None,
+                            WorkerErrorKind::MemoryMismatch,
+                            detail,
+                        );
+                    };
                     let step_res = mk::run_absolut_step(
                         &mut alloc.chunks,
                         base_word,
@@ -1709,40 +1773,8 @@ fn mem_worker(
                         test_id,
                         &keep,
                         &add_bytes,
+                        &on_error,
                     );
-                    if step_res.bad_words > 0 {
-                        if step_res.bad_words > 1 {
-                            shared
-                                .total_errors
-                                .fetch_add(step_res.bad_words - 1, Ordering::Relaxed);
-                        }
-                        let detail = match step_res.first {
-                            Some(mm) => format!(
-                                "Absolut C{cycle} T{test_id} p{}/{total_sub} ({}): {} word(s) mismatched (chunk {}, offset {} B, exp=0x{:016X}, got=0x{:016X}, diff=0x{:016X})",
-                                sub_pass + 1,
-                                mk::absolut_test_name(test_id),
-                                step_res.bad_words,
-                                mm.chunk_idx,
-                                mm.word_idx * 8,
-                                mm.expected,
-                                mm.actual,
-                                mm.expected ^ mm.actual
-                            ),
-                            None => format!(
-                                "Absolut C{cycle} T{test_id} p{}/{total_sub} ({}): {} word(s) mismatched",
-                                sub_pass + 1,
-                                mk::absolut_test_name(test_id),
-                                step_res.bad_words
-                            ),
-                        };
-                        shared.record_error(
-                            &*events,
-                            worker,
-                            None,
-                            WorkerErrorKind::MemoryMismatch,
-                            detail,
-                        );
-                    }
                     if step_res.aborted || !shared.should_continue() {
                         break 'absolut;
                     }

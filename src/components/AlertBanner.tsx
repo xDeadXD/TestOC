@@ -86,7 +86,11 @@ export function AlertBanner() {
           <button
             type="button"
             onClick={() => setLogOpen((v) => !v)}
-            className="text-[11px] text-slate-400 hover:text-slate-200"
+            className={`text-[11px] ${
+              workerErrors.length > 0
+                ? "rounded border border-red-500/50 bg-red-950/60 px-2 py-0.5 font-semibold text-red-200 hover:bg-red-900/60"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
           >
             {logOpen ? "Hide Event Log" : `Event Log (${alerts.length} alerts, ${workerErrors.length} errors)`}
           </button>

@@ -24,7 +24,7 @@ const KINDS: Array<{ id: StressKind; label: string; desc: string }> = [
 ];
 
 const MEM_PROFILES: Array<{ id: MemoryProfile; label: string; sub: string; badge: string }> = [
-  { id: "absolut", label: "Absolut (32-Step)", sub: "~25-30m/C · NT + Mirror128", badge: "Harsh" },
+  { id: "absolut", label: "Absolut (32-Step)", sub: "LCG R/W + Mirror128", badge: "Harsh" },
   { id: "standard", label: "Standard", sub: "Selectable bit-exact", badge: "Custom" },
 ];
 
@@ -71,6 +71,7 @@ const PHASE_BADGE: Record<string, string> = {
 export function StressPanel() {
   const info = useTelemetryStore((s) => s.info);
   const stress = useTelemetryStore((s) => s.stress);
+  const workerErrors = useTelemetryStore((s) => s.workerErrors);
   const limits = useTelemetryStore((s) => s.limits);
   const updateLimits = useTelemetryStore((s) => s.updateLimits);
   const startStress = useTelemetryStore((s) => s.startStress);
@@ -550,7 +551,7 @@ export function StressPanel() {
         )}
 
         {form.kind === "memory" && form.memProfile === "absolut" && (
-          <div className="space-y-1.5 rounded border border-orange-500/30 bg-orange-950/20 px-2.5 py-2">
+          <div className="rounded border border-orange-500/30 bg-orange-950/20 px-2.5 py-2">
             <div className="flex items-center justify-between text-[10px] text-slate-300 uppercase">
               <span>Absolut Cycles</span>
               <div className="flex gap-1">
@@ -574,9 +575,6 @@ export function StressPanel() {
                   );
                 })}
               </div>
-            </div>
-            <div className="text-[10px] leading-snug text-slate-400">
-              Full 32-step Absolut DRAM sequence (~25–30 min/cycle on 16 GiB, constant 99%+ RAM): AVX2 NT-stream bypass, MirrorMove128, 4K Mirror, Cross-Chunk BlockMove, Modulo20 &amp; clflush Rowhammer.
             </div>
           </div>
         )}
@@ -1017,6 +1015,23 @@ export function StressPanel() {
           {stress.timeCapS && (
             <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">
               No CPU thermal sensor — capped at {Math.round(stress.timeCapS / 60)} min
+            </div>
+          )}
+
+          {workerErrors.length > 0 && (
+            <div
+              data-testid="worker-error-log"
+              className="max-h-32 space-y-1 overflow-y-auto rounded border border-red-500/50 bg-red-950/40 p-2 font-mono text-[10px]"
+            >
+              <div className="text-[9px] font-bold tracking-wider text-red-300 uppercase">
+                Detected Errors ({workerErrors.length})
+              </div>
+              {workerErrors.slice(0, 10).map((e, idx) => (
+                <div key={`${e.timestampMs}-${idx}`} className="break-all border-t border-red-500/20 pt-1 text-red-200">
+                  <span className="mr-1.5 text-red-400/80">{new Date(e.timestampMs).toTimeString().slice(0, 8)}</span>
+                  {e.detail}
+                </div>
+              ))}
             </div>
           )}
 

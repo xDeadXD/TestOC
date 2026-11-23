@@ -333,7 +333,7 @@ export function installMockIpc(): void {
             vramAllocatedBytes: cfg.kind === "vram" ? Math.round((11 * GB * cfg.targetPct) / 100) : 0,
             message:
               cfg.kind === "memory" && cfg.profile === "absolut"
-                ? `Absolut ${cfg.cycles ? `C1/${cfg.cycles}` : "C1"} · Step 1/32 · T0 RefreshStable (tREFI/tRFC) (1/32)`
+                ? `Absolut ${cfg.cycles ? `C1/${cfg.cycles}` : "C1"} · Step 1/32 · T1 SimpleTest M2 (LCG 0x7777/0x3333) (1/36)`
                 : cfg.kind === "cpu" && cfg.mode === "coreCycler"
                   ? `Core Cycler · Core 1/${cfg.threads ?? 8} (Peak Boost)`
                   : cfg.kind === "cpu" && cfg.workload === "fftTorture"
