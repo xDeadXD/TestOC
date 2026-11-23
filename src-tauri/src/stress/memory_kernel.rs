@@ -1,12 +1,14 @@
 //! Memory stress engine: Absolut 32-step DRAM/IMC suite + classic pattern runner.
 //!
 //! Every test is 100% deterministic and bit-exact (zero subjectivity, zero false positives).
-//! Absolut starts immediately on T1 (`SimpleTest` Mode 2 LCG `0x77777777 / 0x33333333`) using
-//! AVX2 256-bit non-temporal streaming stores (`_mm256_stream_si256` + `_mm_sfence`),
-//! non-temporal prefetch loads (`_MM_HINT_NTA`), bijective bank-strided 4 KiB DRAM row-conflict
-//! page jumping, simultaneous cold-DRAM Read-Verify + opposing-chunk NT-Write bus turnarounds
-//! (`tRDWR`/`tWRRD`/`tWTR`/`ODT`), cross-allocation non-temporal `MirrorMove128` / `MirrorMove 4K`
-//! with full 64-bit transit inversion, and `_mm_clflush` aggressor rowhammer sweeps.
+//! Absolut uses pure-AVX2 zero-scalar-overhead pattern generators (8-lane 32-bit vector LCG
+//! `0x77777777 / 0x33333333`, `0xFFFFFFFF / 0x55555555`, and BL8 64-pin DQ max-toggle rails)
+//! driven through full-chunk bijective 64-byte / 128-byte coprime row-conflict in-place RMW
+//! scatter (100% L1/L2/L3 miss + 100% DRAM row-buffer miss across channel, rank, bank-group,
+//! bank, row, and column bits simultaneously), rotating cached Write-Back RFO dirty-eviction
+//! storms with Non-Temporal WC-bypass (`_mm256_stream_si256`), cross-chunk simultaneous cold-DRAM
+//! Read<->Write turnarounds (`tRDWR`/`tWRRD`/`tWTR`/`ODT`), coprime-scattered cross-allocation
+//! `MirrorMove128` / `MirrorMove 4K`, and `_mm_clflush` aggressor rowhammer sweeps.
 
 use std::sync::atomic::{compiler_fence, Ordering};
 
@@ -21,10 +23,12 @@ pub const FINE_TOPUP_CHUNK_BYTES: usize = 4 << 20;
 pub const STEP_WORDS: usize = (1 << 20) / 8;
 /// One 4 KiB OS page in 64-bit words (64 cache lines).
 const PAGE_WORDS: usize = 512;
-/// 128-byte dual-cache-line stripe in 64-bit words (used for 100% DRAM row-miss bank thrashing).
+/// One 64-byte CPU cache line / DDR BL8 burst in 64-bit words.
+const CACHELINE_WORDS: usize = 8;
+/// 128-byte dual-cache-line stripe in 64-bit words (for MirrorMove128 / dual-channel interleave).
 const STRIPE128_WORDS: usize = 16;
-/// 4 MiB superblock in 4 KiB pages (1024 pages fit inside L2 TLB while 16T x 4 MiB = 64 MiB > L3).
-const BLOCK4M_PAGES: usize = 1024;
+/// Coprime stride divisors rotated across passes so every pass hits a fresh DRAM bank/row order.
+const SCATTER_DIVS: &[usize] = &[13, 17, 19, 23, 29, 31, 37, 41];
 pub const MIN_TARGET_BYTES: u64 = 128 << 20;
 /// Standard OS safety reserve (128 MiB); drops to 64 MiB at >=98% and 24 MiB at 100% (OOM-safe).
 pub const FREE_FLOOR_BYTES: u64 = 128 << 20;
@@ -267,49 +271,30 @@ fn splitmix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Dual 32-bit LCG generator implementing Absolut T1 (`Pattern Param0=0x77777777, Param1=0x33333333`)
-/// with cross-lane rotation and alternating odd-word inversion for maximum 64-bit DQ crosstalk/SSN.
+/// Exact scalar counterpart of the 8-lane AVX2 32-bit dual-round vector LCG with alternating
+/// odd-word BL8 inversion (used for scalar fallback, tail words, and exact mismatch diagnostics).
 #[inline(always)]
-fn absolut_lcg_t1(seed: u64, g: u64) -> u64 {
-    let mut lo = ((g ^ seed) as u32)
-        .wrapping_mul(0x7777_7777)
-        .wrapping_add(0x3333_3333);
-    lo = lo
-        .rotate_left(13)
-        .wrapping_mul(0x7777_7777)
-        .wrapping_add(0x3333_3333);
-    let mut hi = (((g >> 32) ^ (seed >> 32) ^ (g.wrapping_mul(0x9E37_79B9) >> 16)) as u32)
-        .wrapping_mul(0x7777_7777)
-        .wrapping_add(0x3333_3333);
-    hi = hi
-        .rotate_left(17)
-        .wrapping_mul(0x7777_7777)
-        .wrapping_add(0x3333_3333);
-    let w = (lo as u64) | ((hi as u64) << 32);
-    if (g & 1) == 0 {
-        w
+fn vec_lcg_word(seed32: u32, mul32: u32, add32: u32, idx: usize, invert: bool) -> u64 {
+    let i0 = (idx as u32).wrapping_mul(2).wrapping_add(seed32);
+    let i1 = i0.wrapping_add(1);
+    let mut a = i0.wrapping_mul(mul32).wrapping_add(add32);
+    a = a.wrapping_mul(mul32).wrapping_add(add32);
+    let mut b = i1.wrapping_mul(mul32).wrapping_add(add32);
+    b = b.wrapping_mul(mul32).wrapping_add(add32);
+    let w = (a as u64) | ((b as u64) << 32);
+    let flipped = if (idx & 1) == 0 { w } else { !w };
+    if invert {
+        !flipped
     } else {
-        !w
+        flipped
     }
 }
 
-/// Dual 32-bit LCG generator implementing Absolut T15 (`Pattern Param0=0xFFFFFFFF, Param1=0x55555555`)
-/// with alternating 64-byte cache-line inversion so adjacent beats hammer both `0x55/0xAA` and random rails.
+/// Deterministic 32-bit per-chunk seed derived from worker base, chunk word offset, and step seed.
 #[inline(always)]
-fn absolut_lcg_t15(seed: u64, g: u64) -> u64 {
-    let x = splitmix64(g ^ seed);
-    let lo = (x as u32)
-        .wrapping_mul(0xFFFF_FFFF)
-        .wrapping_add(0x5555_5555);
-    let hi = ((x >> 32) as u32)
-        .wrapping_mul(0xFFFF_FFFF)
-        .wrapping_add(0x5555_5555);
-    let w = (lo as u64) | ((hi as u64) << 32);
-    if ((g >> 3) & 1) == 0 {
-        w
-    } else {
-        !w
-    }
+fn chunk_seed32(base_word: u64, chunk_start: u64, seed: u64) -> u32 {
+    let h = splitmix64(base_word ^ chunk_start.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed);
+    (h as u32) ^ ((h >> 32) as u32)
 }
 
 /// Stateless expected value for a word in the classic Standard pattern runner.
@@ -371,6 +356,26 @@ fn coprime_stride(len: usize, desired: usize) -> usize {
         s = (s + 1) % len;
         if s == 0 {
             s = 1;
+        }
+    }
+    s
+}
+
+/// Full-chunk coprime scatter stride (`~len / div`, odd) so consecutive 64B/128B accesses jump
+/// multi-MiB + odd cache-line offsets, toggling channel/rank/bank-group/bank/row/column bits on
+/// every single touch for 100% L3 & DRAM row-buffer misses.
+fn pick_scatter_stride(len: usize, div: usize) -> usize {
+    if len <= 1 {
+        return 1;
+    }
+    let mut s = (len / div.max(2)).max(1) | 1;
+    if s >= len {
+        s = 1;
+    }
+    while gcd(s, len) != 1 {
+        s += 2;
+        if s >= len {
+            return coprime_stride(len, 1);
         }
     }
     s
@@ -852,13 +857,14 @@ unsafe fn dual_verify_and_write_avx2<const WRITE_BACK: bool>(
     (bad, first)
 }
 
-/// Swap two disjoint equal-length blocks AND bitwise-invert every word using non-temporal AVX2
-/// stores (`_mm256_stream_si256`), preventing L3 cache masking and flipping all 64 DQ lanes in transit.
+/// Swap two disjoint equal-length blocks AND bitwise-invert every word using AVX2 stores
+/// (Non-Temporal `_mm256_stream_si256` when `WRITE_BACK=false`, or cached Write-Back RFO when
+/// `WRITE_BACK=true`), flipping all 64 DQ lanes in transit.
 #[inline]
-fn nt_swap_invert_blocks(a: &mut [u64], b: &mut [u64]) {
+fn swap_invert_blocks<const WRITE_BACK: bool>(a: &mut [u64], b: &mut [u64]) {
     debug_assert_eq!(a.len(), b.len());
     if has_avx2() && a.len() >= 4 {
-        unsafe { nt_swap_invert_blocks_avx2(a, b) };
+        unsafe { swap_invert_blocks_avx2::<WRITE_BACK>(a, b) };
         return;
     }
     for (xa, xb) in a.iter_mut().zip(b.iter_mut()) {
@@ -872,16 +878,16 @@ fn nt_swap_invert_blocks(a: &mut [u64], b: &mut [u64]) {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn nt_swap_invert_blocks_avx2(a: &mut [u64], b: &mut [u64]) {
+unsafe fn swap_invert_blocks_avx2<const WRITE_BACK: bool>(a: &mut [u64], b: &mut [u64]) {
     use std::arch::x86_64::*;
     let len = a.len();
     let ap = a.as_mut_ptr();
     let bp = b.as_mut_ptr();
-    let aligned_both = ((ap as usize) & 31) == 0 && ((bp as usize) & 31) == 0;
+    let use_nt = !WRITE_BACK && ((ap as usize) & 31) == 0 && ((bp as usize) & 31) == 0;
     let ones = _mm256_set1_epi64x(-1i64);
     let mut i = 0usize;
     let end4 = len & !3;
-    if aligned_both {
+    if use_nt {
         while i < end4 {
             let va = _mm256_xor_si256(_mm256_loadu_si256(ap.add(i) as *const __m256i), ones);
             let vb = _mm256_xor_si256(_mm256_loadu_si256(bp.add(i) as *const __m256i), ones);
@@ -905,6 +911,785 @@ unsafe fn nt_swap_invert_blocks_avx2(a: &mut [u64], b: &mut [u64]) {
         std::ptr::write_volatile(bp.add(i), !va);
         i += 1;
     }
+}
+
+/// Fast 4x-unrolled AVX2 cached fill for a 2-word repeating `(even, odd)` BL8 toggle pattern.
+fn fill_pair_cached(s: &mut [u64], even: u64, odd: u64) {
+    if has_avx2() && s.len() >= 16 {
+        unsafe { fill_pair_cached_avx2(s, even, odd) };
+        return;
+    }
+    for (i, w) in s.iter_mut().enumerate() {
+        let v = if (i & 1) == 0 { even } else { odd };
+        unsafe { std::ptr::write_volatile(w, v) };
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn fill_pair_cached_avx2(s: &mut [u64], even: u64, odd: u64) {
+    use std::arch::x86_64::*;
+    let len = s.len();
+    let ptr = s.as_mut_ptr();
+    let v = _mm256_set_epi64x(odd as i64, even as i64, odd as i64, even as i64);
+    let mut i = 0usize;
+    let end16 = len & !15;
+    while i < end16 {
+        _mm256_storeu_si256(ptr.add(i) as *mut __m256i, v);
+        _mm256_storeu_si256(ptr.add(i + 4) as *mut __m256i, v);
+        _mm256_storeu_si256(ptr.add(i + 8) as *mut __m256i, v);
+        _mm256_storeu_si256(ptr.add(i + 12) as *mut __m256i, v);
+        i += 16;
+    }
+    while i < len {
+        std::ptr::write_volatile(ptr.add(i), if (i & 1) == 0 { even } else { odd });
+        i += 1;
+    }
+}
+
+/// Pure AVX2 8-lane 32-bit Vector LCG fill (`v = (v * mul32 + add32)` x 2 rounds) with
+/// alternating odd-word BL8 inversion. Zero scalar ALU overhead (~40-50 GB/s).
+fn fill_vec_lcg_slice<const WRITE_BACK: bool>(
+    s: &mut [u64],
+    word_offset: usize,
+    seed32: u32,
+    mul32: u32,
+    add32: u32,
+    invert: bool,
+) {
+    if has_avx2() && s.len() >= 8 {
+        unsafe {
+            fill_vec_lcg_avx2::<WRITE_BACK>(s, word_offset, seed32, mul32, add32, invert);
+        }
+        return;
+    }
+    for (i, w) in s.iter_mut().enumerate() {
+        let v = vec_lcg_word(seed32, mul32, add32, word_offset + i, invert);
+        unsafe { std::ptr::write_volatile(w, v) };
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn fill_vec_lcg_avx2<const WRITE_BACK: bool>(
+    s: &mut [u64],
+    word_offset: usize,
+    seed32: u32,
+    mul32: u32,
+    add32: u32,
+    invert: bool,
+) {
+    use std::arch::x86_64::*;
+    let len = s.len();
+    let ptr = s.as_mut_ptr();
+    let mis = if WRITE_BACK { 0 } else { (ptr as usize) & 31 };
+    let prefix = if mis == 0 { 0 } else { (32 - mis) / 8 }.min(len);
+    for i in 0..prefix {
+        std::ptr::write_volatile(
+            ptr.add(i),
+            vec_lcg_word(seed32, mul32, add32, word_offset + i, invert),
+        );
+    }
+    let mul = _mm256_set1_epi32(mul32 as i32);
+    let add = _mm256_set1_epi32(add32 as i32);
+    let eff_invert = invert ^ (((word_offset + prefix) & 1) != 0);
+    let odd_flip = if eff_invert {
+        _mm256_set_epi64x(0, -1, 0, -1)
+    } else {
+        _mm256_set_epi64x(-1, 0, -1, 0)
+    };
+    let step = _mm256_set1_epi32(8);
+    let b0 = ((word_offset + prefix) as u32)
+        .wrapping_mul(2)
+        .wrapping_add(seed32);
+    let mut idx = _mm256_setr_epi32(
+        b0 as i32,
+        b0.wrapping_add(1) as i32,
+        b0.wrapping_add(2) as i32,
+        b0.wrapping_add(3) as i32,
+        b0.wrapping_add(4) as i32,
+        b0.wrapping_add(5) as i32,
+        b0.wrapping_add(6) as i32,
+        b0.wrapping_add(7) as i32,
+    );
+    let mut i = prefix;
+    let end4 = prefix + ((len - prefix) & !3);
+    while i < end4 {
+        let v1 = _mm256_add_epi32(_mm256_mullo_epi32(idx, mul), add);
+        let v2 = _mm256_xor_si256(_mm256_add_epi32(_mm256_mullo_epi32(v1, mul), add), odd_flip);
+        if WRITE_BACK {
+            _mm256_storeu_si256(ptr.add(i) as *mut __m256i, v2);
+        } else {
+            _mm256_stream_si256(ptr.add(i) as *mut __m256i, v2);
+        }
+        idx = _mm256_add_epi32(idx, step);
+        i += 4;
+    }
+    while i < len {
+        std::ptr::write_volatile(
+            ptr.add(i),
+            vec_lcg_word(seed32, mul32, add32, word_offset + i, invert),
+        );
+        i += 1;
+    }
+    if !WRITE_BACK {
+        _mm_sfence();
+    }
+}
+
+/// Pure AVX2 8-lane 32-bit Vector LCG verification (matches `fill_vec_lcg_slice` bit-for-bit).
+fn verify_vec_lcg_slice(
+    s: &[u64],
+    word_offset: usize,
+    seed32: u32,
+    mul32: u32,
+    add32: u32,
+    invert: bool,
+) -> (u64, Option<(usize, u64, u64)>) {
+    compiler_fence(Ordering::SeqCst);
+    if has_avx2() && s.len() >= 8 {
+        return unsafe { verify_vec_lcg_avx2(s, word_offset, seed32, mul32, add32, invert) };
+    }
+    let mut bad = 0u64;
+    let mut first = None;
+    for (i, w) in s.iter().enumerate() {
+        let got = unsafe { std::ptr::read_volatile(w) };
+        let exp = vec_lcg_word(seed32, mul32, add32, word_offset + i, invert);
+        if got != exp {
+            bad += 1;
+            first.get_or_insert((word_offset + i, exp, got));
+        }
+    }
+    (bad, first)
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn verify_vec_lcg_avx2(
+    s: &[u64],
+    word_offset: usize,
+    seed32: u32,
+    mul32: u32,
+    add32: u32,
+    invert: bool,
+) -> (u64, Option<(usize, u64, u64)>) {
+    use std::arch::x86_64::*;
+    let len = s.len();
+    let ptr = s.as_ptr();
+    let mul = _mm256_set1_epi32(mul32 as i32);
+    let add = _mm256_set1_epi32(add32 as i32);
+    let eff_invert = invert ^ ((word_offset & 1) != 0);
+    let odd_flip = if eff_invert {
+        _mm256_set_epi64x(0, -1, 0, -1)
+    } else {
+        _mm256_set_epi64x(-1, 0, -1, 0)
+    };
+    let step = _mm256_set1_epi32(8);
+    let b0 = (word_offset as u32).wrapping_mul(2).wrapping_add(seed32);
+    let mut idx = _mm256_setr_epi32(
+        b0 as i32,
+        b0.wrapping_add(1) as i32,
+        b0.wrapping_add(2) as i32,
+        b0.wrapping_add(3) as i32,
+        b0.wrapping_add(4) as i32,
+        b0.wrapping_add(5) as i32,
+        b0.wrapping_add(6) as i32,
+        b0.wrapping_add(7) as i32,
+    );
+    let mut bad = 0u64;
+    let mut first = None;
+    let mut i = 0usize;
+    let end4 = len & !3;
+    while i < end4 {
+        let v1 = _mm256_add_epi32(_mm256_mullo_epi32(idx, mul), add);
+        let ev = _mm256_xor_si256(_mm256_add_epi32(_mm256_mullo_epi32(v1, mul), add), odd_flip);
+        let gv = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        if _mm256_movemask_epi8(_mm256_cmpeq_epi64(gv, ev)) != -1i32 {
+            for k in 0..4 {
+                let got = std::ptr::read_volatile(ptr.add(i + k));
+                let exp = vec_lcg_word(seed32, mul32, add32, word_offset + i + k, invert);
+                if got != exp {
+                    bad += 1;
+                    first.get_or_insert((word_offset + i + k, exp, got));
+                }
+            }
+        }
+        idx = _mm256_add_epi32(idx, step);
+        i += 4;
+    }
+    while i < len {
+        let got = std::ptr::read_volatile(ptr.add(i));
+        let exp = vec_lcg_word(seed32, mul32, add32, word_offset + i, invert);
+        if got != exp {
+            bad += 1;
+            first.get_or_insert((word_offset + i, exp, got));
+        }
+        i += 1;
+    }
+    (bad, first)
+}
+
+/// Full-chunk 64-byte or 128-byte coprime row-conflict in-place RMW for a repeating `(even, odd)`
+/// pair. Visits every block exactly once across the entire chunk (multi-MiB + odd cache-line jump),
+/// forcing 100% L1/L2/L3 + DRAM row-buffer misses and writing exact `(!even, !odd)` (zero cascade).
+#[allow(clippy::too_many_arguments)]
+fn scatter_pair_rmw_chunk<const WRITE_BACK: bool>(
+    chunk_idx: usize,
+    chunk: &mut [u64],
+    blk_words: usize,
+    even: u64,
+    odd: u64,
+    stride_div: usize,
+    reverse: bool,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) -> bool {
+    debug_assert!(blk_words == CACHELINE_WORDS || blk_words == STRIPE128_WORDS);
+    compiler_fence(Ordering::SeqCst);
+    let blks = chunk.len() / blk_words;
+    if blks > 0 {
+        if has_avx2() {
+            if !unsafe {
+                scatter_pair_rmw_avx2::<WRITE_BACK>(
+                    chunk_idx, chunk, blks, blk_words, even, odd, stride_div, reverse, res,
+                    keep_going, add_bytes, on_error,
+                )
+            } {
+                return false;
+            }
+        } else {
+            let stride = pick_scatter_stride(blks, stride_div);
+            let mut b = if reverse { blks - 1 } else { 0 };
+            let mut done_words = 0usize;
+            for _ in 0..blks {
+                if done_words >= STEP_WORDS {
+                    if !keep_going() {
+                        return false;
+                    }
+                    add_bytes((done_words * 16) as u64);
+                    done_words = 0;
+                }
+                let w = b * blk_words;
+                let mut bad = 0u64;
+                let mut first = None;
+                for k in 0..blk_words {
+                    let got = unsafe { std::ptr::read_volatile(&chunk[w + k]) };
+                    let exp = if ((w + k) & 1) == 0 { even } else { odd };
+                    if got != exp {
+                        bad += 1;
+                        first.get_or_insert((w + k, exp, got));
+                    }
+                    unsafe { std::ptr::write_volatile(&mut chunk[w + k], !exp) };
+                }
+                res.record(chunk_idx, bad, first, on_error);
+                done_words += blk_words;
+                if reverse {
+                    b = if b >= stride {
+                        b - stride
+                    } else {
+                        b + blks - stride
+                    };
+                } else {
+                    b += stride;
+                    if b >= blks {
+                        b -= blks;
+                    }
+                }
+            }
+            if done_words > 0 {
+                add_bytes((done_words * 16) as u64);
+            }
+        }
+    }
+    let tail = blks * blk_words;
+    if tail < chunk.len() {
+        let mut bad = 0u64;
+        let mut first = None;
+        for (k, slot) in chunk[tail..].iter_mut().enumerate() {
+            let idx = tail + k;
+            let got = unsafe { std::ptr::read_volatile(slot) };
+            let exp = if (idx & 1) == 0 { even } else { odd };
+            if got != exp {
+                bad += 1;
+                first.get_or_insert((idx, exp, got));
+            }
+            unsafe { std::ptr::write_volatile(slot, !exp) };
+        }
+        res.record(chunk_idx, bad, first, on_error);
+        add_bytes(((chunk.len() - tail) * 16) as u64);
+    }
+    true
+}
+
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn scatter_pair_rmw_avx2<const WRITE_BACK: bool>(
+    chunk_idx: usize,
+    chunk: &mut [u64],
+    blks: usize,
+    blk_words: usize,
+    even: u64,
+    odd: u64,
+    stride_div: usize,
+    reverse: bool,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) -> bool {
+    use std::arch::x86_64::*;
+    let stride = pick_scatter_stride(blks, stride_div);
+    let ptr = chunk.as_mut_ptr();
+    let use_nt = !WRITE_BACK && ((ptr as usize) & 31) == 0;
+    let ev = _mm256_set_epi64x(odd as i64, even as i64, odd as i64, even as i64);
+    let next_ev = _mm256_set_epi64x((!odd) as i64, (!even) as i64, (!odd) as i64, (!even) as i64);
+    let mut b = if reverse { blks - 1 } else { 0 };
+    let mut done_words = 0usize;
+    for _ in 0..blks {
+        if done_words >= STEP_WORDS {
+            if use_nt {
+                _mm_sfence();
+            }
+            if !keep_going() {
+                return false;
+            }
+            add_bytes((done_words * 16) as u64);
+            done_words = 0;
+        }
+        let w = b * blk_words;
+        let mut off = 0usize;
+        while off < blk_words {
+            let g0 = _mm256_loadu_si256(ptr.add(w + off) as *const __m256i);
+            let g1 = _mm256_loadu_si256(ptr.add(w + off + 4) as *const __m256i);
+            let all = _mm256_and_si256(_mm256_cmpeq_epi64(g0, ev), _mm256_cmpeq_epi64(g1, ev));
+            if _mm256_movemask_epi8(all) != -1i32 {
+                let mut bad = 0u64;
+                let mut first = None;
+                for k in 0..8 {
+                    let got = std::ptr::read_volatile(ptr.add(w + off + k));
+                    let exp = if ((w + off + k) & 1) == 0 { even } else { odd };
+                    if got != exp {
+                        bad += 1;
+                        first.get_or_insert((w + off + k, exp, got));
+                    }
+                }
+                res.record(chunk_idx, bad, first, on_error);
+            }
+            if use_nt {
+                _mm256_stream_si256(ptr.add(w + off) as *mut __m256i, next_ev);
+                _mm256_stream_si256(ptr.add(w + off + 4) as *mut __m256i, next_ev);
+            } else {
+                _mm256_storeu_si256(ptr.add(w + off) as *mut __m256i, next_ev);
+                _mm256_storeu_si256(ptr.add(w + off + 4) as *mut __m256i, next_ev);
+            }
+            off += 8;
+        }
+        done_words += blk_words;
+        if reverse {
+            b = if b >= stride {
+                b - stride
+            } else {
+                b + blks - stride
+            };
+        } else {
+            b += stride;
+            if b >= blks {
+                b -= blks;
+            }
+        }
+    }
+    if done_words > 0 {
+        add_bytes((done_words * 16) as u64);
+    }
+    if use_nt {
+        _mm_sfence();
+    }
+    true
+}
+
+/// Full-chunk 64-byte or 128-byte coprime row-conflict in-place RMW for pure AVX2 Vector LCG
+/// (`mul32 / add32` + alternating odd-word BL8 inversion). Verifies exact `invert` state and
+/// writes exact `!invert` state (zero error cascade) at ~30+ GB/s of random DRAM row-misses.
+#[allow(clippy::too_many_arguments)]
+fn scatter_vec_lcg_rmw_chunk<const WRITE_BACK: bool>(
+    chunk_idx: usize,
+    chunk: &mut [u64],
+    blk_words: usize,
+    seed32: u32,
+    mul32: u32,
+    add32: u32,
+    invert: bool,
+    stride_div: usize,
+    reverse: bool,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) -> bool {
+    debug_assert!(blk_words == CACHELINE_WORDS || blk_words == STRIPE128_WORDS);
+    compiler_fence(Ordering::SeqCst);
+    let blks = chunk.len() / blk_words;
+    if blks > 0 {
+        if has_avx2() {
+            if !unsafe {
+                scatter_vec_lcg_rmw_avx2::<WRITE_BACK>(
+                    chunk_idx, chunk, blks, blk_words, seed32, mul32, add32, invert, stride_div,
+                    reverse, res, keep_going, add_bytes, on_error,
+                )
+            } {
+                return false;
+            }
+        } else {
+            let stride = pick_scatter_stride(blks, stride_div);
+            let mut b = if reverse { blks - 1 } else { 0 };
+            let mut done_words = 0usize;
+            for _ in 0..blks {
+                if done_words >= STEP_WORDS {
+                    if !keep_going() {
+                        return false;
+                    }
+                    add_bytes((done_words * 16) as u64);
+                    done_words = 0;
+                }
+                let w = b * blk_words;
+                let mut bad = 0u64;
+                let mut first = None;
+                for k in 0..blk_words {
+                    let got = unsafe { std::ptr::read_volatile(&chunk[w + k]) };
+                    let exp = vec_lcg_word(seed32, mul32, add32, w + k, invert);
+                    if got != exp {
+                        bad += 1;
+                        first.get_or_insert((w + k, exp, got));
+                    }
+                    unsafe { std::ptr::write_volatile(&mut chunk[w + k], !exp) };
+                }
+                res.record(chunk_idx, bad, first, on_error);
+                done_words += blk_words;
+                if reverse {
+                    b = if b >= stride {
+                        b - stride
+                    } else {
+                        b + blks - stride
+                    };
+                } else {
+                    b += stride;
+                    if b >= blks {
+                        b -= blks;
+                    }
+                }
+            }
+            if done_words > 0 {
+                add_bytes((done_words * 16) as u64);
+            }
+        }
+    }
+    let tail = blks * blk_words;
+    if tail < chunk.len() {
+        let mut bad = 0u64;
+        let mut first = None;
+        for (k, slot) in chunk[tail..].iter_mut().enumerate() {
+            let idx = tail + k;
+            let got = unsafe { std::ptr::read_volatile(slot) };
+            let exp = vec_lcg_word(seed32, mul32, add32, idx, invert);
+            if got != exp {
+                bad += 1;
+                first.get_or_insert((idx, exp, got));
+            }
+            unsafe { std::ptr::write_volatile(slot, !exp) };
+        }
+        res.record(chunk_idx, bad, first, on_error);
+        add_bytes(((chunk.len() - tail) * 16) as u64);
+    }
+    true
+}
+
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn scatter_vec_lcg_rmw_avx2<const WRITE_BACK: bool>(
+    chunk_idx: usize,
+    chunk: &mut [u64],
+    blks: usize,
+    blk_words: usize,
+    seed32: u32,
+    mul32: u32,
+    add32: u32,
+    invert: bool,
+    stride_div: usize,
+    reverse: bool,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) -> bool {
+    use std::arch::x86_64::*;
+    let stride = pick_scatter_stride(blks, stride_div);
+    let ptr = chunk.as_mut_ptr();
+    let use_nt = !WRITE_BACK && ((ptr as usize) & 31) == 0;
+    let mul = _mm256_set1_epi32(mul32 as i32);
+    let add = _mm256_set1_epi32(add32 as i32);
+    let odd_flip = if invert {
+        _mm256_set_epi64x(0, -1, 0, -1)
+    } else {
+        _mm256_set_epi64x(-1, 0, -1, 0)
+    };
+    let ones = _mm256_set1_epi64x(-1i64);
+    let offs0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let offs1 = _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15);
+    let mut b = if reverse { blks - 1 } else { 0 };
+    let mut done_words = 0usize;
+    for _ in 0..blks {
+        if done_words >= STEP_WORDS {
+            if use_nt {
+                _mm_sfence();
+            }
+            if !keep_going() {
+                return false;
+            }
+            add_bytes((done_words * 16) as u64);
+            done_words = 0;
+        }
+        let w = b * blk_words;
+        let mut off = 0usize;
+        while off < blk_words {
+            let base32 =
+                _mm256_set1_epi32(((w + off) as u32).wrapping_mul(2).wrapping_add(seed32) as i32);
+            let idx0 = _mm256_add_epi32(base32, offs0);
+            let idx1 = _mm256_add_epi32(base32, offs1);
+            let t0 = _mm256_add_epi32(_mm256_mullo_epi32(idx0, mul), add);
+            let e0 = _mm256_xor_si256(_mm256_add_epi32(_mm256_mullo_epi32(t0, mul), add), odd_flip);
+            let t1 = _mm256_add_epi32(_mm256_mullo_epi32(idx1, mul), add);
+            let e1 = _mm256_xor_si256(_mm256_add_epi32(_mm256_mullo_epi32(t1, mul), add), odd_flip);
+            let g0 = _mm256_loadu_si256(ptr.add(w + off) as *const __m256i);
+            let g1 = _mm256_loadu_si256(ptr.add(w + off + 4) as *const __m256i);
+            let all = _mm256_and_si256(_mm256_cmpeq_epi64(g0, e0), _mm256_cmpeq_epi64(g1, e1));
+            if _mm256_movemask_epi8(all) != -1i32 {
+                let mut bad = 0u64;
+                let mut first = None;
+                for k in 0..8 {
+                    let got = std::ptr::read_volatile(ptr.add(w + off + k));
+                    let exp = vec_lcg_word(seed32, mul32, add32, w + off + k, invert);
+                    if got != exp {
+                        bad += 1;
+                        first.get_or_insert((w + off + k, exp, got));
+                    }
+                }
+                res.record(chunk_idx, bad, first, on_error);
+            }
+            let n0 = _mm256_xor_si256(e0, ones);
+            let n1 = _mm256_xor_si256(e1, ones);
+            if use_nt {
+                _mm256_stream_si256(ptr.add(w + off) as *mut __m256i, n0);
+                _mm256_stream_si256(ptr.add(w + off + 4) as *mut __m256i, n1);
+            } else {
+                _mm256_storeu_si256(ptr.add(w + off) as *mut __m256i, n0);
+                _mm256_storeu_si256(ptr.add(w + off + 4) as *mut __m256i, n1);
+            }
+            off += 8;
+        }
+        done_words += blk_words;
+        if reverse {
+            b = if b >= stride {
+                b - stride
+            } else {
+                b + blks - stride
+            };
+        } else {
+            b += stride;
+            if b >= blks {
+                b -= blks;
+            }
+        }
+    }
+    if done_words > 0 {
+        add_bytes((done_words * 16) as u64);
+    }
+    if use_nt {
+        _mm_sfence();
+    }
+    true
+}
+
+/// Full-chunk 64-byte coprime row-conflict in-place RMW for any per-word generator `gen_exp`.
+/// Verifies `gen_exp(base + idx)` and writes `!gen_exp(base + idx)` in-place (zero cascade).
+#[allow(clippy::too_many_arguments)]
+fn scatter_gen_rmw_chunk<const WRITE_BACK: bool>(
+    chunk_idx: usize,
+    chunk: &mut [u64],
+    chunk_base: u64,
+    stride_div: usize,
+    reverse: bool,
+    gen_exp: &impl Fn(u64) -> u64,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) -> bool {
+    compiler_fence(Ordering::SeqCst);
+    let blks = chunk.len() / CACHELINE_WORDS;
+    if blks > 0 {
+        if has_avx2() {
+            if !unsafe {
+                scatter_gen_rmw_avx2::<WRITE_BACK>(
+                    chunk_idx, chunk, chunk_base, blks, stride_div, reverse, gen_exp, res,
+                    keep_going, add_bytes, on_error,
+                )
+            } {
+                return false;
+            }
+        } else {
+            let stride = pick_scatter_stride(blks, stride_div);
+            let mut b = if reverse { blks - 1 } else { 0 };
+            let mut done_words = 0usize;
+            for _ in 0..blks {
+                if done_words >= STEP_WORDS {
+                    if !keep_going() {
+                        return false;
+                    }
+                    add_bytes((done_words * 16) as u64);
+                    done_words = 0;
+                }
+                let w = b * CACHELINE_WORDS;
+                let mut bad = 0u64;
+                let mut first = None;
+                for k in 0..CACHELINE_WORDS {
+                    let got = unsafe { std::ptr::read_volatile(&chunk[w + k]) };
+                    let exp = gen_exp(chunk_base + (w + k) as u64);
+                    if got != exp {
+                        bad += 1;
+                        first.get_or_insert((w + k, exp, got));
+                    }
+                    unsafe { std::ptr::write_volatile(&mut chunk[w + k], !exp) };
+                }
+                res.record(chunk_idx, bad, first, on_error);
+                done_words += CACHELINE_WORDS;
+                if reverse {
+                    b = if b >= stride {
+                        b - stride
+                    } else {
+                        b + blks - stride
+                    };
+                } else {
+                    b += stride;
+                    if b >= blks {
+                        b -= blks;
+                    }
+                }
+            }
+            if done_words > 0 {
+                add_bytes((done_words * 16) as u64);
+            }
+        }
+    }
+    let tail = blks * CACHELINE_WORDS;
+    if tail < chunk.len() {
+        let mut bad = 0u64;
+        let mut first = None;
+        for (k, slot) in chunk[tail..].iter_mut().enumerate() {
+            let idx = tail + k;
+            let got = unsafe { std::ptr::read_volatile(slot) };
+            let exp = gen_exp(chunk_base + idx as u64);
+            if got != exp {
+                bad += 1;
+                first.get_or_insert((idx, exp, got));
+            }
+            unsafe { std::ptr::write_volatile(slot, !exp) };
+        }
+        res.record(chunk_idx, bad, first, on_error);
+        add_bytes(((chunk.len() - tail) * 16) as u64);
+    }
+    true
+}
+
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn scatter_gen_rmw_avx2<const WRITE_BACK: bool>(
+    chunk_idx: usize,
+    chunk: &mut [u64],
+    chunk_base: u64,
+    blks: usize,
+    stride_div: usize,
+    reverse: bool,
+    gen_exp: &impl Fn(u64) -> u64,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) -> bool {
+    use std::arch::x86_64::*;
+    let stride = pick_scatter_stride(blks, stride_div);
+    let ptr = chunk.as_mut_ptr();
+    let use_nt = !WRITE_BACK && ((ptr as usize) & 31) == 0;
+    let ones = _mm256_set1_epi64x(-1i64);
+    let mut b = if reverse { blks - 1 } else { 0 };
+    let mut done_words = 0usize;
+    for _ in 0..blks {
+        if done_words >= STEP_WORDS {
+            if use_nt {
+                _mm_sfence();
+            }
+            if !keep_going() {
+                return false;
+            }
+            add_bytes((done_words * 16) as u64);
+            done_words = 0;
+        }
+        let w = b * CACHELINE_WORDS;
+        let gw = chunk_base + w as u64;
+        let e0 = gen_exp(gw);
+        let e1 = gen_exp(gw + 1);
+        let e2 = gen_exp(gw + 2);
+        let e3 = gen_exp(gw + 3);
+        let e4 = gen_exp(gw + 4);
+        let e5 = gen_exp(gw + 5);
+        let e6 = gen_exp(gw + 6);
+        let e7 = gen_exp(gw + 7);
+        let ev0 = _mm256_set_epi64x(e3 as i64, e2 as i64, e1 as i64, e0 as i64);
+        let ev1 = _mm256_set_epi64x(e7 as i64, e6 as i64, e5 as i64, e4 as i64);
+        let g0 = _mm256_loadu_si256(ptr.add(w) as *const __m256i);
+        let g1 = _mm256_loadu_si256(ptr.add(w + 4) as *const __m256i);
+        let all = _mm256_and_si256(_mm256_cmpeq_epi64(g0, ev0), _mm256_cmpeq_epi64(g1, ev1));
+        if _mm256_movemask_epi8(all) != -1i32 {
+            let exps = [e0, e1, e2, e3, e4, e5, e6, e7];
+            let mut bad = 0u64;
+            let mut first = None;
+            for (k, &exp) in exps.iter().enumerate() {
+                let got = std::ptr::read_volatile(ptr.add(w + k));
+                if got != exp {
+                    bad += 1;
+                    first.get_or_insert((w + k, exp, got));
+                }
+            }
+            res.record(chunk_idx, bad, first, on_error);
+        }
+        let n0 = _mm256_xor_si256(ev0, ones);
+        let n1 = _mm256_xor_si256(ev1, ones);
+        if use_nt {
+            _mm256_stream_si256(ptr.add(w) as *mut __m256i, n0);
+            _mm256_stream_si256(ptr.add(w + 4) as *mut __m256i, n1);
+        } else {
+            _mm256_storeu_si256(ptr.add(w) as *mut __m256i, n0);
+            _mm256_storeu_si256(ptr.add(w + 4) as *mut __m256i, n1);
+        }
+        done_words += CACHELINE_WORDS;
+        if reverse {
+            b = if b >= stride {
+                b - stride
+            } else {
+                b + blks - stride
+            };
+        } else {
+            b += stride;
+            if b >= blks {
+                b -= blks;
+            }
+        }
+    }
+    if done_words > 0 {
+        add_bytes((done_words * 16) as u64);
+    }
+    if use_nt {
+        _mm_sfence();
+    }
+    true
 }
 
 /// Flush a memory address from all CPU cache levels so the next read forces a physical DRAM row open.
@@ -1033,169 +1818,164 @@ fn verify_chunk_strided(
     true
 }
 
-/// Fill `chunk` with 100% DRAM row-miss 128-byte stripes jumping +68 KiB across 4 MiB TLB-resident
-/// superblocks. When `WRITE_BACK=true`, uses cached write-back stores to trigger RFO + async L3
-/// dirty evictions (hammers Infinity Fabric / FCLK / IMC queues); when `false`, uses NT WC-bypass.
+/// High-speed full-chunk coprime row-conflict torture runner for repeating `(even, odd)` BL8
+/// patterns (e.g. `0x0000_0000_0000_0000 / 0xFFFF_FFFF_FFFF_FFFF` toggling all 64 DQ pins on
+/// every DDR burst beat).
+///
+/// Phase 1: Full-bandwidth fill across ALL chunks (total allocation >> L3 -> cold DRAM).
+/// Phase 2: Forward full-chunk 64B/128B coprime row-conflict RMW (`verify pat -> write !pat`).
+/// Phase 3: Reverse full-chunk 64B/128B coprime row-conflict RMW (`verify !pat -> write pat`,
+///          using a distinct coprime divisor to reverse every bank/row sequence).
+/// Phase 4: Full-speed final verification across all chunks.
 #[allow(clippy::too_many_arguments)]
-fn fill_chunk_row_thrash_128b<const WRITE_BACK: bool>(
-    chunk: &mut [u64],
-    chunk_base: u64,
-    stride_hint: usize,
-    reverse: bool,
-    gen: &impl Fn(u64) -> u64,
-    keep_going: &impl Fn() -> bool,
-    add_bytes: &impl Fn(u64),
-) -> bool {
-    let total_pages = chunk.len() / PAGE_WORDS;
-    let mut page_off = 0usize;
-    let mut done_words = 0usize;
-    while page_off < total_pages {
-        let blk_pages = (total_pages - page_off).min(BLOCK4M_PAGES);
-        let blk_base_word = page_off * PAGE_WORDS;
-        let stride = coprime_stride(blk_pages, stride_hint);
-        let stripes_per_page = PAGE_WORDS / STRIPE128_WORDS; // 32
-        for s_idx in 0..stripes_per_page {
-            let s = if reverse {
-                stripes_per_page - 1 - s_idx
-            } else {
-                s_idx
-            };
-            let s_off = s * STRIPE128_WORDS;
-            let mut p = if reverse { blk_pages - 1 } else { 0 };
-            for _ in 0..blk_pages {
-                if done_words >= STEP_WORDS {
-                    if !WRITE_BACK {
-                        sfence_if_x86();
-                    }
-                    if !keep_going() {
-                        return false;
-                    }
-                    add_bytes((done_words * 8) as u64);
-                    done_words = 0;
-                }
-                let w0 = blk_base_word + p * PAGE_WORDS + s_off;
-                fill_gen_nofence::<WRITE_BACK>(
-                    &mut chunk[w0..w0 + STRIPE128_WORDS],
-                    chunk_base + w0 as u64,
-                    gen,
-                );
-                done_words += STRIPE128_WORDS;
-                if reverse {
-                    p = if p >= stride {
-                        p - stride
-                    } else {
-                        p + blk_pages - stride
-                    };
-                } else {
-                    p += stride;
-                    if p >= blk_pages {
-                        p -= blk_pages;
-                    }
-                }
-            }
-        }
-        page_off += blk_pages;
-    }
-    if done_words > 0 {
-        add_bytes((done_words * 8) as u64);
-    }
-    let tail = total_pages * PAGE_WORDS;
-    if tail < chunk.len() {
-        fill_gen_nofence::<WRITE_BACK>(&mut chunk[tail..], chunk_base + tail as u64, gen);
-        add_bytes(((chunk.len() - tail) * 8) as u64);
-    }
-    if !WRITE_BACK {
-        sfence_if_x86();
-    }
-    true
-}
-
-/// Verify `chunk` with 100% DRAM row-miss 128-byte stripes across 4 MiB superblocks + immediate `on_error`.
-#[allow(clippy::too_many_arguments)]
-fn verify_chunk_row_thrash_128b(
-    chunk_idx: usize,
-    chunk: &[u64],
-    chunk_base: u64,
-    stride_hint: usize,
-    reverse: bool,
-    gen: &impl Fn(u64) -> u64,
+fn run_scatter_pair_torture<const WRITE_BACK: bool>(
+    chunks: &mut [(Vec<u64>, u64)],
+    blk_words: usize,
+    even: u64,
+    odd: u64,
+    div_idx: usize,
     res: &mut StepResult,
     keep_going: &impl Fn() -> bool,
     add_bytes: &impl Fn(u64),
     on_error: &impl Fn(u64, MemMismatch),
-) -> bool {
-    let total_pages = chunk.len() / PAGE_WORDS;
-    let mut page_off = 0usize;
-    let mut done_words = 0usize;
-    while page_off < total_pages {
-        let blk_pages = (total_pages - page_off).min(BLOCK4M_PAGES);
-        let blk_base_word = page_off * PAGE_WORDS;
-        let stride = coprime_stride(blk_pages, stride_hint);
-        let stripes_per_page = PAGE_WORDS / STRIPE128_WORDS;
-        for s_idx in 0..stripes_per_page {
-            let s = if reverse {
-                stripes_per_page - 1 - s_idx
-            } else {
-                s_idx
-            };
-            let s_off = s * STRIPE128_WORDS;
-            let mut p = if reverse { blk_pages - 1 } else { 0 };
-            for _ in 0..blk_pages {
-                if done_words >= STEP_WORDS {
-                    if !keep_going() {
-                        return false;
-                    }
-                    add_bytes((done_words * 8) as u64);
-                    done_words = 0;
-                }
-                let w0 = blk_base_word + p * PAGE_WORDS + s_off;
-                let (bad, first) = verify_gen(
-                    &chunk[w0..w0 + STRIPE128_WORDS],
-                    chunk_base + w0 as u64,
-                    w0,
-                    gen,
-                );
-                res.record(chunk_idx, bad, first, on_error);
-                done_words += STRIPE128_WORDS;
-                if reverse {
-                    p = if p >= stride {
-                        p - stride
-                    } else {
-                        p + blk_pages - stride
-                    };
-                } else {
-                    p += stride;
-                    if p >= blk_pages {
-                        p -= blk_pages;
-                    }
-                }
+) {
+    if chunks.is_empty() {
+        return;
+    }
+    let div_fwd = SCATTER_DIVS[div_idx % SCATTER_DIVS.len()];
+    let div_rev = SCATTER_DIVS[(div_idx + 3) % SCATTER_DIVS.len()];
+
+    // Phase 1: High-speed fill across all chunks so every cache line reaches physical DRAM.
+    for (chunk, _) in chunks.iter_mut() {
+        for step in chunk.chunks_mut(STEP_WORDS) {
+            if !keep_going() {
+                res.aborted = true;
+                return;
             }
+            if WRITE_BACK {
+                fill_pair_cached(step, even, odd);
+            } else {
+                nt_fill_pair(step, even, odd);
+            }
+            add_bytes((step.len() * 8) as u64);
         }
-        page_off += blk_pages;
     }
-    if done_words > 0 {
-        add_bytes((done_words * 8) as u64);
+
+    // Phase 2: Forward full-chunk coprime row-conflict in-place RMW (pat -> !pat).
+    for (ci, (chunk, _)) in chunks.iter_mut().enumerate() {
+        if !scatter_pair_rmw_chunk::<WRITE_BACK>(
+            ci, chunk, blk_words, even, odd, div_fwd, false, res, keep_going, add_bytes, on_error,
+        ) {
+            res.aborted = true;
+            return;
+        }
     }
-    let tail = total_pages * PAGE_WORDS;
-    if tail < chunk.len() {
-        let (bad, first) = verify_gen(&chunk[tail..], chunk_base + tail as u64, tail, gen);
-        res.record(chunk_idx, bad, first, on_error);
-        add_bytes(((chunk.len() - tail) * 8) as u64);
+
+    // Phase 3: Reverse full-chunk coprime row-conflict in-place RMW (!pat -> pat).
+    for (ci, (chunk, _)) in chunks.iter_mut().enumerate().rev() {
+        if !scatter_pair_rmw_chunk::<WRITE_BACK>(
+            ci, chunk, blk_words, !even, !odd, div_rev, true, res, keep_going, add_bytes, on_error,
+        ) {
+            res.aborted = true;
+            return;
+        }
     }
-    true
+
+    // Phase 4: Final cold verification pass.
+    for (ci, (chunk, _)) in chunks.iter().enumerate() {
+        for (si, step) in chunk.chunks(STEP_WORDS).enumerate() {
+            if !keep_going() {
+                res.aborted = true;
+                return;
+            }
+            let (bad, first) = verify_pair(step, even, odd, si * STEP_WORDS);
+            res.record(ci, bad, first, on_error);
+            add_bytes((step.len() * 8) as u64);
+        }
+    }
 }
 
-/// Core Absolut SimpleTest 3-phase torture runner:
-///   Phase 1: Bank-strided fill of ALL chunks with `gen_fwd` (total worker RAM >> L3 -> cold DRAM).
-///   Phase 2: Cross-chunk simultaneous cold-DRAM Read-Verify (`chunks[k]`) + cold-DRAM Write
-///            (`chunks[k-1]` with `!gen_fwd`) — hammers `tRDWR`, `tWRRD`, `tWTR`, `tRCD`, `tRP`,
-///            `tFAW`, `tRRD`, ODT, and Infinity Fabric / FCLK simultaneously.
-///   Phase 3: Reverse bank-strided NTA verify of `!gen_fwd` across ALL chunks.
+/// High-speed full-chunk coprime row-conflict torture runner for pure AVX2 8-lane Vector LCG
+/// (`mul32 / add32` + alternating odd-word BL8 inversion). Zero scalar ALU bottleneck (~30+ GB/s).
+#[allow(clippy::too_many_arguments)]
+fn run_scatter_vec_lcg_torture<const WRITE_BACK: bool>(
+    chunks: &mut [(Vec<u64>, u64)],
+    base_word: u64,
+    seed: u64,
+    blk_words: usize,
+    mul32: u32,
+    add32: u32,
+    div_idx: usize,
+    res: &mut StepResult,
+    keep_going: &impl Fn() -> bool,
+    add_bytes: &impl Fn(u64),
+    on_error: &impl Fn(u64, MemMismatch),
+) {
+    if chunks.is_empty() {
+        return;
+    }
+    let div_fwd = SCATTER_DIVS[div_idx % SCATTER_DIVS.len()];
+    let div_rev = SCATTER_DIVS[(div_idx + 3) % SCATTER_DIVS.len()];
+
+    // Phase 1: Full-speed AVX2 Vector LCG fill across all chunks.
+    for (chunk, chunk_start) in chunks.iter_mut() {
+        let s32 = chunk_seed32(base_word, *chunk_start, seed);
+        for (si, step) in chunk.chunks_mut(STEP_WORDS).enumerate() {
+            if !keep_going() {
+                res.aborted = true;
+                return;
+            }
+            fill_vec_lcg_slice::<WRITE_BACK>(step, si * STEP_WORDS, s32, mul32, add32, false);
+            add_bytes((step.len() * 8) as u64);
+        }
+    }
+
+    // Phase 2: Forward full-chunk coprime row-conflict in-place RMW (invert=false -> true).
+    for (ci, (chunk, chunk_start)) in chunks.iter_mut().enumerate() {
+        let s32 = chunk_seed32(base_word, *chunk_start, seed);
+        if !scatter_vec_lcg_rmw_chunk::<WRITE_BACK>(
+            ci, chunk, blk_words, s32, mul32, add32, false, div_fwd, false, res, keep_going,
+            add_bytes, on_error,
+        ) {
+            res.aborted = true;
+            return;
+        }
+    }
+
+    // Phase 3: Reverse full-chunk coprime row-conflict in-place RMW (invert=true -> false).
+    for (ci, (chunk, chunk_start)) in chunks.iter_mut().enumerate().rev() {
+        let s32 = chunk_seed32(base_word, *chunk_start, seed);
+        if !scatter_vec_lcg_rmw_chunk::<WRITE_BACK>(
+            ci, chunk, blk_words, s32, mul32, add32, true, div_rev, true, res, keep_going,
+            add_bytes, on_error,
+        ) {
+            res.aborted = true;
+            return;
+        }
+    }
+
+    // Phase 4: Final cold AVX2 Vector LCG verification pass.
+    for (ci, (chunk, chunk_start)) in chunks.iter().enumerate() {
+        let s32 = chunk_seed32(base_word, *chunk_start, seed);
+        for (si, step) in chunk.chunks(STEP_WORDS).enumerate() {
+            if !keep_going() {
+                res.aborted = true;
+                return;
+            }
+            let (bad, first) =
+                verify_vec_lcg_slice(step, si * STEP_WORDS, s32, mul32, add32, false);
+            res.record(ci, bad, first, on_error);
+            add_bytes((step.len() * 8) as u64);
+        }
+    }
+}
+
+/// Core Absolut SimpleTest multi-mode torture runner for arbitrary per-word pattern generators.
 ///
 /// `rmw_mode` rotates through 3 complementary hardware stress modes across sub-passes:
-///   * `0`: 128B 100%-row-miss bank thrash + cached Write-Back RFO (max FCLK / L3 dirty writeback / IMC queue collisions)
-///   * `1`: 128B 100%-row-miss bank thrash + Non-Temporal WC-bypass (`_mm256_stream_si256` direct DRAM bursts)
-///   * `2`: 4 KiB bank-strided max-bandwidth streaming + Non-Temporal (peak sustained DRAM heat & rail droop)
+///   * `0`: Full-chunk 64B coprime row-conflict cached Write-Back RMW (max DRAM ACT+PRE + L3 dirty evictions)
+///   * `1`: Full-chunk 64B coprime row-conflict Non-Temporal RMW (direct WC-buffer DRAM row-miss storms)
+///   * `2`: 4 KiB bank-strided simultaneous cross-chunk cold-DRAM Read-Verify + NT Write (`tRDWR`/`tWRRD`/`tWTR`)
 #[allow(clippy::too_many_arguments)]
 fn run_simple_dual_rmw(
     chunks: &mut [(Vec<u64>, u64)],
@@ -1213,139 +1993,40 @@ fn run_simple_dual_rmw(
     if n == 0 {
         return;
     }
-    let row_thrash_128b = rmw_mode != 2;
-    let write_back_rfo = rmw_mode == 0;
 
-    // Phase 1: Bank-strided fill across all chunks (total allocation >> L3 so every line reaches DRAM).
-    for (chunk, chunk_start) in chunks.iter_mut() {
-        let ok = if !row_thrash_128b {
-            nt_fill_chunk_strided(
-                chunk,
-                base_word + *chunk_start,
-                stride_hint,
-                false,
-                gen_fwd,
-                keep_going,
-                add_bytes,
-            )
-        } else if write_back_rfo {
-            fill_chunk_row_thrash_128b::<true>(
-                chunk,
-                base_word + *chunk_start,
-                stride_hint,
-                false,
-                gen_fwd,
-                keep_going,
-                add_bytes,
-            )
-        } else {
-            fill_chunk_row_thrash_128b::<false>(
-                chunk,
-                base_word + *chunk_start,
-                stride_hint,
-                false,
-                gen_fwd,
-                keep_going,
-                add_bytes,
-            )
-        };
-        if !ok {
-            res.aborted = true;
-            return;
+    // Modes 0 (Write-Back RFO) & 1 (Non-Temporal): Full-chunk 64-byte coprime row-conflict RMW!
+    if rmw_mode != 2 {
+        let write_back = rmw_mode == 0;
+        let div_fwd = SCATTER_DIVS[stride_hint % SCATTER_DIVS.len()];
+        let div_rev = SCATTER_DIVS[(stride_hint + 3) % SCATTER_DIVS.len()];
+        for (chunk, chunk_start) in chunks.iter_mut() {
+            let cb = base_word + *chunk_start;
+            for (si, step) in chunk.chunks_mut(STEP_WORDS).enumerate() {
+                if !keep_going() {
+                    res.aborted = true;
+                    return;
+                }
+                let b = cb + (si * STEP_WORDS) as u64;
+                if write_back {
+                    fill_gen_nofence::<true>(step, b, gen_fwd);
+                } else {
+                    fill_gen_nofence::<false>(step, b, gen_fwd);
+                }
+                add_bytes((step.len() * 8) as u64);
+            }
+            if !write_back {
+                sfence_if_x86();
+            }
         }
-    }
-
-    // Phase 2: Simultaneous cross-chunk cold-DRAM Read-Verify + cold-DRAM Write invert.
-    if n == 1 {
-        let (chunk, chunk_start) = &mut chunks[0];
-        let b = base_word + *chunk_start;
-        let ok_v = if row_thrash_128b {
-            verify_chunk_row_thrash_128b(
-                0,
-                chunk,
-                b,
-                stride_hint,
-                true,
-                gen_fwd,
-                res,
-                keep_going,
-                add_bytes,
-                on_error,
-            )
-        } else {
-            verify_chunk_strided(
-                0,
-                chunk,
-                b,
-                stride_hint,
-                true,
-                gen_fwd,
-                res,
-                keep_going,
-                add_bytes,
-                on_error,
-            )
-        };
-        if !ok_v {
-            res.aborted = true;
-            return;
-        }
-        let ok_w = if !row_thrash_128b {
-            nt_fill_chunk_strided(chunk, b, stride_hint, true, &gen_inv, keep_going, add_bytes)
-        } else if write_back_rfo {
-            fill_chunk_row_thrash_128b::<true>(
-                chunk,
-                b,
-                stride_hint,
-                true,
-                &gen_inv,
-                keep_going,
-                add_bytes,
-            )
-        } else {
-            fill_chunk_row_thrash_128b::<false>(
-                chunk,
-                b,
-                stride_hint,
-                true,
-                &gen_inv,
-                keep_going,
-                add_bytes,
-            )
-        };
-        if !ok_w {
-            res.aborted = true;
-            return;
-        }
-    } else {
-        // Step 2a: Verify chunks[0] so it becomes a cold verified target for simultaneous write.
-        {
-            let (c0, s0) = &chunks[0];
-            let ok = if row_thrash_128b {
-                verify_chunk_row_thrash_128b(
-                    0,
-                    c0,
-                    base_word + *s0,
-                    stride_hint,
-                    false,
-                    gen_fwd,
-                    res,
-                    keep_going,
-                    add_bytes,
-                    on_error,
+        for (ci, (chunk, chunk_start)) in chunks.iter_mut().enumerate() {
+            let cb = base_word + *chunk_start;
+            let ok = if write_back {
+                scatter_gen_rmw_chunk::<true>(
+                    ci, chunk, cb, div_fwd, false, gen_fwd, res, keep_going, add_bytes, on_error,
                 )
             } else {
-                verify_chunk_strided(
-                    0,
-                    c0,
-                    base_word + *s0,
-                    stride_hint,
-                    false,
-                    gen_fwd,
-                    res,
-                    keep_going,
-                    add_bytes,
-                    on_error,
+                scatter_gen_rmw_chunk::<false>(
+                    ci, chunk, cb, div_fwd, false, gen_fwd, res, keep_going, add_bytes, on_error,
                 )
             };
             if !ok {
@@ -1353,7 +2034,95 @@ fn run_simple_dual_rmw(
                 return;
             }
         }
-        // Step 2b: For k = 1..n, read-verify chunks[k] while simultaneously writing !gen_fwd to chunks[k-1].
+        for (ci, (chunk, chunk_start)) in chunks.iter_mut().enumerate().rev() {
+            let cb = base_word + *chunk_start;
+            let ok = if write_back {
+                scatter_gen_rmw_chunk::<true>(
+                    ci, chunk, cb, div_rev, true, &gen_inv, res, keep_going, add_bytes, on_error,
+                )
+            } else {
+                scatter_gen_rmw_chunk::<false>(
+                    ci, chunk, cb, div_rev, true, &gen_inv, res, keep_going, add_bytes, on_error,
+                )
+            };
+            if !ok {
+                res.aborted = true;
+                return;
+            }
+        }
+        for (ci, (chunk, chunk_start)) in chunks.iter().enumerate() {
+            let cb = base_word + *chunk_start;
+            for (si, step) in chunk.chunks(STEP_WORDS).enumerate() {
+                if !keep_going() {
+                    res.aborted = true;
+                    return;
+                }
+                let w0 = si * STEP_WORDS;
+                let (bad, first) = verify_gen(step, cb + w0 as u64, w0, gen_fwd);
+                res.record(ci, bad, first, on_error);
+                add_bytes((step.len() * 8) as u64);
+            }
+        }
+        return;
+    }
+
+    // Mode 2: 4 KiB bank-strided simultaneous cross-chunk cold-DRAM Read-Verify + NT Write turnaround.
+    for (chunk, chunk_start) in chunks.iter_mut() {
+        if !nt_fill_chunk_strided(
+            chunk,
+            base_word + *chunk_start,
+            stride_hint,
+            false,
+            gen_fwd,
+            keep_going,
+            add_bytes,
+        ) {
+            res.aborted = true;
+            return;
+        }
+    }
+
+    if n == 1 {
+        let (chunk, chunk_start) = &mut chunks[0];
+        let b = base_word + *chunk_start;
+        if !verify_chunk_strided(
+            0,
+            chunk,
+            b,
+            stride_hint,
+            true,
+            gen_fwd,
+            res,
+            keep_going,
+            add_bytes,
+            on_error,
+        ) {
+            res.aborted = true;
+            return;
+        }
+        if !nt_fill_chunk_strided(chunk, b, stride_hint, true, &gen_inv, keep_going, add_bytes) {
+            res.aborted = true;
+            return;
+        }
+    } else {
+        {
+            let (c0, s0) = &chunks[0];
+            if !verify_chunk_strided(
+                0,
+                c0,
+                base_word + *s0,
+                stride_hint,
+                false,
+                gen_fwd,
+                res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ) {
+                res.aborted = true;
+                return;
+            }
+        }
         for k in 1..n {
             let (left, right) = chunks.split_at_mut(k);
             let (dst_vec, dst_start) = &mut left[k - 1];
@@ -1363,106 +2132,41 @@ fn run_simple_dual_rmw(
             let common = src_vec.len().min(dst_vec.len());
             let common_pages = common / PAGE_WORDS;
             if common_pages > 0 {
-                if row_thrash_128b {
-                    // 128-byte simultaneous cold-DRAM READ + WRITE jumping across DRAM rows!
-                    let mut page_off = 0usize;
-                    let mut done_words = 0usize;
-                    let stripes_per_page = PAGE_WORDS / STRIPE128_WORDS;
-                    while page_off < common_pages {
-                        let blk_pages = (common_pages - page_off).min(BLOCK4M_PAGES);
-                        let blk_base_word = page_off * PAGE_WORDS;
-                        let stride = coprime_stride(blk_pages, stride_hint);
-                        for s_idx in 0..stripes_per_page {
-                            let s_off = (stripes_per_page - 1 - s_idx) * STRIPE128_WORDS;
-                            let mut p = blk_pages - 1;
-                            for _ in 0..blk_pages {
-                                if done_words >= STEP_WORDS {
-                                    if !write_back_rfo {
-                                        sfence_if_x86();
-                                    }
-                                    if !keep_going() {
-                                        res.aborted = true;
-                                        return;
-                                    }
-                                    add_bytes((done_words * 16) as u64);
-                                    done_words = 0;
-                                }
-                                let w0 = blk_base_word + p * PAGE_WORDS + s_off;
-                                let (bad, first) = if write_back_rfo {
-                                    dual_verify_and_write_slice::<true>(
-                                        &src_vec[w0..w0 + STRIPE128_WORDS],
-                                        src_base + w0 as u64,
-                                        w0,
-                                        gen_fwd,
-                                        &mut dst_vec[w0..w0 + STRIPE128_WORDS],
-                                        dst_base + w0 as u64,
-                                        &gen_inv,
-                                    )
-                                } else {
-                                    dual_verify_and_write_slice::<false>(
-                                        &src_vec[w0..w0 + STRIPE128_WORDS],
-                                        src_base + w0 as u64,
-                                        w0,
-                                        gen_fwd,
-                                        &mut dst_vec[w0..w0 + STRIPE128_WORDS],
-                                        dst_base + w0 as u64,
-                                        &gen_inv,
-                                    )
-                                };
-                                res.record(k, bad, first, on_error);
-                                done_words += STRIPE128_WORDS;
-                                p = if p >= stride {
-                                    p - stride
-                                } else {
-                                    p + blk_pages - stride
-                                };
-                            }
-                        }
-                        page_off += blk_pages;
-                    }
-                    if done_words > 0 {
-                        add_bytes((done_words * 16) as u64);
-                    }
-                    if !write_back_rfo {
+                let stride = coprime_stride(common_pages, stride_hint);
+                let mut p = common_pages - 1;
+                let mut done_words = 0usize;
+                for _ in 0..common_pages {
+                    if done_words >= STEP_WORDS {
                         sfence_if_x86();
-                    }
-                } else {
-                    let stride = coprime_stride(common_pages, stride_hint);
-                    let mut p = common_pages - 1;
-                    let mut done_words = 0usize;
-                    for _ in 0..common_pages {
-                        if done_words >= STEP_WORDS {
-                            sfence_if_x86();
-                            if !keep_going() {
-                                res.aborted = true;
-                                return;
-                            }
-                            add_bytes((done_words * 16) as u64);
-                            done_words = 0;
+                        if !keep_going() {
+                            res.aborted = true;
+                            return;
                         }
-                        let w0 = p * PAGE_WORDS;
-                        let (bad, first) = dual_verify_and_write_slice::<false>(
-                            &src_vec[w0..w0 + PAGE_WORDS],
-                            src_base + w0 as u64,
-                            w0,
-                            gen_fwd,
-                            &mut dst_vec[w0..w0 + PAGE_WORDS],
-                            dst_base + w0 as u64,
-                            &gen_inv,
-                        );
-                        res.record(k, bad, first, on_error);
-                        done_words += PAGE_WORDS;
-                        p = if p >= stride {
-                            p - stride
-                        } else {
-                            p + common_pages - stride
-                        };
-                    }
-                    if done_words > 0 {
                         add_bytes((done_words * 16) as u64);
+                        done_words = 0;
                     }
-                    sfence_if_x86();
+                    let w0 = p * PAGE_WORDS;
+                    let (bad, first) = dual_verify_and_write_slice::<false>(
+                        &src_vec[w0..w0 + PAGE_WORDS],
+                        src_base + w0 as u64,
+                        w0,
+                        gen_fwd,
+                        &mut dst_vec[w0..w0 + PAGE_WORDS],
+                        dst_base + w0 as u64,
+                        &gen_inv,
+                    );
+                    res.record(k, bad, first, on_error);
+                    done_words += PAGE_WORDS;
+                    p = if p >= stride {
+                        p - stride
+                    } else {
+                        p + common_pages - stride
+                    };
                 }
+                if done_words > 0 {
+                    add_bytes((done_words * 16) as u64);
+                }
+                sfence_if_x86();
             }
             let covered = common_pages * PAGE_WORDS;
             if covered < src_vec.len() {
@@ -1490,92 +2194,52 @@ fn run_simple_dual_rmw(
                 return;
             }
         }
-        // Step 2c: Write !gen_fwd to the final chunk chunks[n-1] (already verified in Step 2b).
         let (last_vec, last_start) = &mut chunks[n - 1];
-        let ok = if !row_thrash_128b {
-            nt_fill_chunk_strided(
-                last_vec,
-                base_word + *last_start,
-                stride_hint,
-                true,
-                &gen_inv,
-                keep_going,
-                add_bytes,
-            )
-        } else if write_back_rfo {
-            fill_chunk_row_thrash_128b::<true>(
-                last_vec,
-                base_word + *last_start,
-                stride_hint,
-                true,
-                &gen_inv,
-                keep_going,
-                add_bytes,
-            )
-        } else {
-            fill_chunk_row_thrash_128b::<false>(
-                last_vec,
-                base_word + *last_start,
-                stride_hint,
-                true,
-                &gen_inv,
-                keep_going,
-                add_bytes,
-            )
-        };
-        if !ok {
+        if !nt_fill_chunk_strided(
+            last_vec,
+            base_word + *last_start,
+            stride_hint,
+            true,
+            &gen_inv,
+            keep_going,
+            add_bytes,
+        ) {
             res.aborted = true;
             return;
         }
     }
 
-    // Phase 3: Reverse bank-strided verify of !gen_fwd across all chunks (cold from physical DRAM).
     for (ci, (chunk, chunk_start)) in chunks.iter().enumerate().rev() {
-        let ok = if row_thrash_128b {
-            verify_chunk_row_thrash_128b(
-                ci,
-                chunk,
-                base_word + *chunk_start,
-                stride_hint,
-                true,
-                &gen_inv,
-                res,
-                keep_going,
-                add_bytes,
-                on_error,
-            )
-        } else {
-            verify_chunk_strided(
-                ci,
-                chunk,
-                base_word + *chunk_start,
-                stride_hint,
-                true,
-                &gen_inv,
-                res,
-                keep_going,
-                add_bytes,
-                on_error,
-            )
-        };
-        if !ok {
+        if !verify_chunk_strided(
+            ci,
+            chunk,
+            base_word + *chunk_start,
+            stride_hint,
+            true,
+            &gen_inv,
+            res,
+            keep_going,
+            add_bytes,
+            on_error,
+        ) {
             res.aborted = true;
             return;
         }
     }
 }
 
-/// Cross-allocation non-temporal MirrorMove with full 64-bit transit inversion.
+/// Cross-allocation coprime-scattered MirrorMove with full 64-bit transit inversion.
 ///
-/// Pairs opposing-end chunks (`chunks[c]` <-> `chunks[n - 1 - c]`) so every 128-byte stripe or
-/// 4 KiB page crosses the full worker allocation (hundreds of MiB apart, never trapped in L3).
-/// Uses parity-preserving mirrored block indices `2*(pairs - 1 - j) + parity` so striped even/odd
-/// passes (`Some(0)`, `Some(1)`) are cleanly involutive on both opposing chunk pairs and odd middle chunks.
+/// Pairs opposing-end chunks (`chunks[c]` <-> `chunks[n - 1 - c]`) and traverses block pairs in
+/// bijective coprime row-conflict order (`j = (j + stride) % pair_cnt`) so every 128-byte stripe
+/// or 4 KiB page triggers a physical DRAM row-buffer miss across opposite regions of RAM.
+/// Rotates between cached Write-Back RFO (`WRITE_BACK=true`) and Non-Temporal WC-bypass (`false`).
 #[allow(clippy::too_many_arguments)]
-fn cross_chunk_nt_mirror(
+fn cross_chunk_mirror<const WRITE_BACK: bool>(
     chunks: &mut [(Vec<u64>, u64)],
     block_words: usize,
     striped_parity: Option<usize>,
+    stride_div: usize,
     keep_going: &impl Fn() -> bool,
     add_bytes: &impl Fn(u64),
 ) -> bool {
@@ -1587,8 +2251,13 @@ fn cross_chunk_nt_mirror(
         let a = &mut left[c].0;
         let b = &mut right[0].0;
         let pair_cnt = (a.len().min(b.len()) / block_words) / 2;
+        if pair_cnt == 0 {
+            continue;
+        }
+        let stride = pick_scatter_stride(pair_cnt, stride_div);
+        let mut j = 0usize;
         let mut done_words = 0usize;
-        for j in 0..pair_cnt {
+        for _ in 0..pair_cnt {
             for parity in 0..2usize {
                 if let Some(want) = striped_parity {
                     if parity != want {
@@ -1596,7 +2265,9 @@ fn cross_chunk_nt_mirror(
                     }
                 }
                 if done_words >= STEP_WORDS {
-                    sfence_if_x86();
+                    if !WRITE_BACK {
+                        sfence_if_x86();
+                    }
                     if !keep_going() {
                         return false;
                     }
@@ -1605,50 +2276,71 @@ fn cross_chunk_nt_mirror(
                 }
                 let lo = (2 * j + parity) * block_words;
                 let hi = (2 * (pair_cnt - 1 - j) + parity) * block_words;
-                nt_swap_invert_blocks(&mut a[lo..lo + block_words], &mut b[hi..hi + block_words]);
+                swap_invert_blocks::<WRITE_BACK>(
+                    &mut a[lo..lo + block_words],
+                    &mut b[hi..hi + block_words],
+                );
                 done_words += block_words;
+            }
+            j += stride;
+            if j >= pair_cnt {
+                j -= pair_cnt;
             }
         }
         if done_words > 0 {
             add_bytes((done_words * 16) as u64);
         }
-        sfence_if_x86();
+        if !WRITE_BACK {
+            sfence_if_x86();
+        }
     }
-    // If odd chunk count, mirror the middle chunk from opposite ends using the exact same parity pairing.
+    // If odd chunk count, mirror the middle chunk from opposite ends in coprime row-miss order.
     if (n & 1) == 1 {
         let mid = &mut chunks[chunk_pairs].0;
         let pair_cnt = (mid.len() / block_words) / 2;
         let half = pair_cnt / 2;
-        let mut done_words = 0usize;
-        for j in 0..half {
-            for parity in 0..2usize {
-                if let Some(want) = striped_parity {
-                    if parity != want {
-                        continue;
+        if half > 0 {
+            let stride = pick_scatter_stride(half, stride_div);
+            let mut j = 0usize;
+            let mut done_words = 0usize;
+            for _ in 0..half {
+                for parity in 0..2usize {
+                    if let Some(want) = striped_parity {
+                        if parity != want {
+                            continue;
+                        }
                     }
-                }
-                if done_words >= STEP_WORDS {
-                    sfence_if_x86();
-                    if !keep_going() {
-                        return false;
+                    if done_words >= STEP_WORDS {
+                        if !WRITE_BACK {
+                            sfence_if_x86();
+                        }
+                        if !keep_going() {
+                            return false;
+                        }
+                        add_bytes((done_words * 16) as u64);
+                        done_words = 0;
                     }
-                    add_bytes((done_words * 16) as u64);
-                    done_words = 0;
+                    let lo = (2 * j + parity) * block_words;
+                    let hi = (2 * (pair_cnt - 1 - j) + parity) * block_words;
+                    let (l_part, r_part) = mid.split_at_mut(hi);
+                    swap_invert_blocks::<WRITE_BACK>(
+                        &mut l_part[lo..lo + block_words],
+                        &mut r_part[..block_words],
+                    );
+                    done_words += block_words;
                 }
-                let lo = (2 * j + parity) * block_words;
-                let hi = (2 * (pair_cnt - 1 - j) + parity) * block_words;
-                let (l_part, r_part) = mid.split_at_mut(hi);
-                nt_swap_invert_blocks(
-                    &mut l_part[lo..lo + block_words],
-                    &mut r_part[..block_words],
-                );
-                done_words += block_words;
+                j += stride;
+                if j >= half {
+                    j -= half;
+                }
+            }
+            if done_words > 0 {
+                add_bytes((done_words * 16) as u64);
+            }
+            if !WRITE_BACK {
+                sfence_if_x86();
             }
         }
-        if done_words > 0 {
-            add_bytes((done_words * 16) as u64);
-        }
-        sfence_if_x86();
     }
     true
 }
@@ -1761,21 +2453,82 @@ pub fn run_absolut_step(
             ^ 0xA5A5_5A5A_1234_5678,
     );
 
-    // Rotate 3 complementary DRAM/IMC/FCLK stress modes:
-    //   0 = 128B row-miss + Write-Back RFO (max FCLK/L3 dirty writeback/IMC collisions)
-    //   1 = 128B row-miss + Non-Temporal WC-bypass
-    //   2 = 4 KiB max-bandwidth + Non-Temporal
+    // Rotate complementary DRAM/IMC/FCLK stress modes across sub-passes:
+    //   0 = 64B full-chunk coprime row-conflict Cached Write-Back RMW (max ACT+PRE + L3 dirty evictions)
+    //   1 = 64B full-chunk coprime row-conflict Non-Temporal RMW (WC-bypass direct DRAM bursts)
+    //   2 = 4 KiB cross-chunk simultaneous cold-DRAM Read-Verify + NT Write turnaround (tRDWR/tWRRD/tWTR)
     let rmw_mode = sub_pass % 3;
+    let div_idx = (step_idx + sub_pass as usize + cycle as usize) % SCATTER_DIVS.len();
+    let mirror_div = SCATTER_DIVS[div_idx];
+    let mirror_wb = (sub_pass & 1) == 0;
     match test_id {
-        // T1 (FIRST STEP IN SEQUENCE): SimpleTest M2 — True LCG (0x77777777 / 0x33333333)
-        1 => {
-            let gen = |g: u64| absolut_lcg_t1(seed, g);
-            run_simple_dual_rmw(
-                chunks, base_word, 33, rmw_mode, &gen, &mut res, keep_going, add_bytes, on_error,
-            );
-        }
+        // T1 (FIRST STEP IN SEQUENCE): SimpleTest M2 — Full-chunk 64B/128B coprime row-conflict
+        // BL8 64-pin DQ max-toggle + pure AVX2 8-lane Vector LCG (0x77777777 / 0x33333333).
+        1 => match sub_pass % 5 {
+            0 => run_scatter_pair_torture::<true>(
+                chunks,
+                CACHELINE_WORDS,
+                0x0000_0000_0000_0000,
+                0xFFFF_FFFF_FFFF_FFFF,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            1 => run_scatter_vec_lcg_torture::<true>(
+                chunks,
+                base_word,
+                seed,
+                CACHELINE_WORDS,
+                0x7777_7777,
+                0x3333_3333,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            2 => run_scatter_pair_torture::<false>(
+                chunks,
+                CACHELINE_WORDS,
+                0xFFFF_FFFF_FFFF_FFFF,
+                0x0000_0000_0000_0000,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            3 => run_scatter_vec_lcg_torture::<false>(
+                chunks,
+                base_word,
+                seed,
+                CACHELINE_WORDS,
+                0x7777_7777,
+                0x3333_3333,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            _ => run_scatter_vec_lcg_torture::<true>(
+                chunks,
+                base_word,
+                seed,
+                STRIPE128_WORDS,
+                0x7777_7777,
+                0x3333_3333,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+        },
 
-        // T2: SimpleTest M1 — Rotating variable cache-line DQ polarity flips + R<->W turnaround.
+        // T2: SimpleTest M1 — Rotating variable cache-line DQ polarity flips + 64B row-conflict RMW.
         2 => {
             let (l0e, l0o, l1e, l1o) = match (step_idx + sub_pass as usize) & 3 {
                 0 => (
@@ -1809,7 +2562,7 @@ pub fn run_absolut_step(
             );
         }
 
-        // T3: MirrorMove128 (Param 2) — Cross-allocation striped 128B NT mirror + 64-bit invert.
+        // T3: MirrorMove128 (Param 2) — Coprime row-conflict striped 128B mirror + 64-bit invert.
         3 => {
             let tag = |g: u64| absolut_tag(seed, g);
             for (chunk, chunk_start) in chunks.iter_mut() {
@@ -1827,7 +2580,12 @@ pub fn run_absolut_step(
                 }
             }
             // Pass A: Mirror + invert EVEN 128-byte stripes across opposite ends of worker RAM.
-            if !cross_chunk_nt_mirror(chunks, 16, Some(0), keep_going, add_bytes) {
+            let ok_a = if mirror_wb {
+                cross_chunk_mirror::<true>(chunks, 16, Some(0), mirror_div, keep_going, add_bytes)
+            } else {
+                cross_chunk_mirror::<false>(chunks, 16, Some(0), mirror_div, keep_going, add_bytes)
+            };
+            if !ok_a {
                 res.aborted = true;
                 return res;
             }
@@ -1838,7 +2596,12 @@ pub fn run_absolut_step(
                 return res;
             }
             // Pass B: Mirror + invert ODD 128-byte stripes across opposite ends of worker RAM.
-            if !cross_chunk_nt_mirror(chunks, 16, Some(1), keep_going, add_bytes) {
+            let ok_b = if mirror_wb {
+                cross_chunk_mirror::<true>(chunks, 16, Some(1), mirror_div, keep_going, add_bytes)
+            } else {
+                cross_chunk_mirror::<false>(chunks, 16, Some(1), mirror_div, keep_going, add_bytes)
+            };
+            if !ok_b {
                 res.aborted = true;
                 return res;
             }
@@ -1850,7 +2613,7 @@ pub fn run_absolut_step(
             }
         }
 
-        // T4: MirrorMove (Param 4) — Cross-allocation 4 KiB page NT mirror + 64-bit invert.
+        // T4: MirrorMove (Param 4) — Coprime row-conflict 4 KiB page mirror + 64-bit invert.
         4 => {
             let tag = |g: u64| absolut_tag(seed, g);
             for (chunk, chunk_start) in chunks.iter_mut() {
@@ -1867,7 +2630,16 @@ pub fn run_absolut_step(
                     return res;
                 }
             }
-            if !cross_chunk_nt_mirror(chunks, PAGE_WORDS, None, keep_going, add_bytes) {
+            let ok_m = if mirror_wb {
+                cross_chunk_mirror::<true>(
+                    chunks, PAGE_WORDS, None, mirror_div, keep_going, add_bytes,
+                )
+            } else {
+                cross_chunk_mirror::<false>(
+                    chunks, PAGE_WORDS, None, mirror_div, keep_going, add_bytes,
+                )
+            };
+            if !ok_m {
                 res.aborted = true;
                 return res;
             }
@@ -1880,7 +2652,7 @@ pub fn run_absolut_step(
             }
         }
 
-        // T5: MirrorMove128 (Param 1) — Cross-allocation contiguous 128B NT mirror + invert + restore.
+        // T5: MirrorMove128 (Param 1) — Coprime row-conflict contiguous 128B mirror + invert + restore.
         5 => {
             let tag = |g: u64| absolut_tag(seed, g);
             for (chunk, chunk_start) in chunks.iter_mut() {
@@ -1898,7 +2670,12 @@ pub fn run_absolut_step(
                 }
             }
             // Mirror + invert pass 1.
-            if !cross_chunk_nt_mirror(chunks, 16, None, keep_going, add_bytes) {
+            let ok_1 = if mirror_wb {
+                cross_chunk_mirror::<true>(chunks, 16, None, mirror_div, keep_going, add_bytes)
+            } else {
+                cross_chunk_mirror::<false>(chunks, 16, None, mirror_div, keep_going, add_bytes)
+            };
+            if !ok_1 {
                 res.aborted = true;
                 return res;
             }
@@ -1909,7 +2686,12 @@ pub fn run_absolut_step(
                 return res;
             }
             // Mirror + invert pass 2 (restores exact original un-inverted data).
-            if !cross_chunk_nt_mirror(chunks, 16, None, keep_going, add_bytes) {
+            let ok_2 = if mirror_wb {
+                cross_chunk_mirror::<true>(chunks, 16, None, mirror_div, keep_going, add_bytes)
+            } else {
+                cross_chunk_mirror::<false>(chunks, 16, None, mirror_div, keep_going, add_bytes)
+            };
+            if !ok_2 {
                 res.aborted = true;
                 return res;
             }
@@ -1922,7 +2704,7 @@ pub fn run_absolut_step(
             }
         }
 
-        // T6: SimpleTest M0 (4M) — Heavy moving inversions + cross-chunk bank-strided R<->W.
+        // T6: SimpleTest M0 (4M) — High-speed BL8 Moving Inversions in 64B/128B coprime row-conflict RMW.
         6 => {
             let pat = match iter_idx & 3 {
                 0 => 0x0000_0000_0000_0000u64,
@@ -1930,10 +2712,41 @@ pub fn run_absolut_step(
                 2 => 0x5555_5555_5555_5555u64,
                 _ => 0xAAAA_AAAA_AAAA_AAAAu64,
             };
-            let gen = |g: u64| if (g & 1) == 0 { pat } else { !pat };
-            run_simple_dual_rmw(
-                chunks, base_word, 33, rmw_mode, &gen, &mut res, keep_going, add_bytes, on_error,
-            );
+            match rmw_mode {
+                0 => run_scatter_pair_torture::<true>(
+                    chunks,
+                    CACHELINE_WORDS,
+                    pat,
+                    !pat,
+                    div_idx,
+                    &mut res,
+                    keep_going,
+                    add_bytes,
+                    on_error,
+                ),
+                1 => run_scatter_pair_torture::<false>(
+                    chunks,
+                    CACHELINE_WORDS,
+                    pat,
+                    !pat,
+                    div_idx,
+                    &mut res,
+                    keep_going,
+                    add_bytes,
+                    on_error,
+                ),
+                _ => run_scatter_pair_torture::<true>(
+                    chunks,
+                    STRIPE128_WORDS,
+                    pat,
+                    !pat,
+                    div_idx,
+                    &mut res,
+                    keep_going,
+                    add_bytes,
+                    on_error,
+                ),
+            }
         }
 
         // T7: SimpleTest M0 (8M) — Rotating Single-Bit DQ Aggressor / Victim across all 8 bit lanes.
@@ -1976,17 +2789,50 @@ pub fn run_absolut_step(
             );
         }
 
-        // T9: SimpleTest M0 (32M) — LCG + SplitMix64 high-entropy bus toggle R<->W.
-        9 => {
-            let mul = 0x5851_F42D_4C95_7F2Du64;
-            let add = seed | 1;
-            let gen = |g: u64| splitmix64(g.wrapping_mul(mul).wrapping_add(add));
-            run_simple_dual_rmw(
-                chunks, base_word, 65, rmw_mode, &gen, &mut res, keep_going, add_bytes, on_error,
-            );
-        }
+        // T9: SimpleTest M0 (32M) — Pure AVX2 Vector PRNG high-entropy 64B/128B row-conflict RMW.
+        9 => match rmw_mode {
+            0 => run_scatter_vec_lcg_torture::<true>(
+                chunks,
+                base_word,
+                seed,
+                CACHELINE_WORDS,
+                0x85EB_CA6B,
+                0xC2B2_AE35,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            1 => run_scatter_vec_lcg_torture::<false>(
+                chunks,
+                base_word,
+                seed,
+                CACHELINE_WORDS,
+                0x85EB_CA6B,
+                0xC2B2_AE35,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            _ => run_scatter_vec_lcg_torture::<true>(
+                chunks,
+                base_word,
+                seed,
+                STRIPE128_WORDS,
+                0x85EB_CA6B,
+                0xC2B2_AE35,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+        },
 
-        // T10: SimpleTest M0 (64M) — Modulo20 Bank-Conflict Scatter at full AVX2 NT bandwidth.
+        // T10: SimpleTest M0 (64M) — Modulo20 Bank-Conflict Scatter at full AVX2 bandwidth.
         10 => {
             let phase = iter_idx % 20;
             let pat_hit = 0xD555_AAAA_5555_D5AAu64 ^ seed;
@@ -2117,7 +2963,7 @@ pub fn run_absolut_step(
             );
         }
 
-        // T13: SimpleTest M0 (512M) — Walking 64-bit 1s & 0s + bank-strided R<->W.
+        // T13: SimpleTest M0 (512M) — Walking 64-bit 1s & 0s + 64B row-conflict RMW.
         13 => {
             let gen = |g: u64| {
                 let bit = 1u64.rotate_left(((g + iter_idx) & 63) as u32);
@@ -2256,13 +3102,44 @@ pub fn run_absolut_step(
             }
         }
 
-        // T15 (default, runs 8x per cycle): SimpleTest M2 — 0xFFFFFFFF / 0x55555555 R<->W turnaround.
-        _ => {
-            let gen = |g: u64| absolut_lcg_t15(seed, g);
-            run_simple_dual_rmw(
-                chunks, base_word, 29, rmw_mode, &gen, &mut res, keep_going, add_bytes, on_error,
-            );
-        }
+        // T15 (default, runs 8x per cycle): SimpleTest M2 — 0xFFFFFFFF / 0x55555555 64B coprime RMW.
+        _ => match rmw_mode {
+            0 => run_scatter_pair_torture::<true>(
+                chunks,
+                CACHELINE_WORDS,
+                0xFFFF_FFFF_FFFF_FFFF,
+                0x5555_5555_5555_5555,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            1 => run_scatter_vec_lcg_torture::<true>(
+                chunks,
+                base_word,
+                seed,
+                CACHELINE_WORDS,
+                0x9E37_79B9,
+                0x5555_5555,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+            _ => run_scatter_pair_torture::<false>(
+                chunks,
+                CACHELINE_WORDS,
+                0x0000_0000_0000_0000,
+                0xFFFF_FFFF_FFFF_FFFF,
+                div_idx,
+                &mut res,
+                keep_going,
+                add_bytes,
+                on_error,
+            ),
+        },
     }
 
     res
@@ -2353,7 +3230,12 @@ mod tests {
     #[test]
     fn absolut_all_16_tests_roundtrip_even_odd_and_mixed_chunks() {
         // Test 1 chunk, 2 equal chunks, and 3 mismatched chunks (simulating 64M + 16M + 4M top-up).
-        let layouts: &[&[usize]] = &[&[32_768], &[32_768, 32_768], &[32_768, 12_345, 24_576]];
+        let layouts: &[&[usize]] = &[
+            &[32_768],
+            &[32_768, 32_768],
+            &[32_768, 12_345, 24_576],
+            &[519, 17],
+        ];
         for sizes in layouts {
             let mut off = 0u64;
             let mut chunks: Vec<(Vec<u64>, u64)> = sizes
@@ -2365,7 +3247,7 @@ mod tests {
                 })
                 .collect();
             for test_id in 0..=15u8 {
-                for sub_pass in 0..3u32 {
+                for sub_pass in 0..5u32 {
                     let errs = RefCell::new(Vec::new());
                     let res = run_absolut_step(
                         &mut chunks,
@@ -2396,41 +3278,114 @@ mod tests {
     }
 
     #[test]
-    fn absolut_dual_rmw_and_mirror_detect_single_bit_fault_immediately() {
-        // 1) Verify dual_verify_and_nt_write_slice catches a single flipped bit with exact XOR diff.
-        let base = 0x1000u64;
-        let gen = |g: u64| absolut_lcg_t1(0xDEAD_BEEF, g);
-        let inv = |g: u64| !gen(g);
-        let mut src = vec![0u64; 4096];
-        let mut dst = vec![0u64; 4096];
-        nt_fill_gen_nofence(&mut src, base, &gen);
-        sfence_if_x86();
-        src[777] ^= 1u64 << 43;
-        let (bad, first) =
-            dual_verify_and_write_slice::<false>(&src, base, 0, &gen, &mut dst, base + 4096, &inv);
-        assert_eq!(bad, 1);
-        let (idx, exp, got) = first.unwrap();
-        assert_eq!(idx, 777);
-        assert_eq!(exp ^ got, 1u64 << 43);
-        // Verify Write-Back RFO path catches the same single bit flip as well.
-        let (bad_wb, first_wb) =
-            dual_verify_and_write_slice::<true>(&src, base, 0, &gen, &mut dst, base + 4096, &inv);
-        assert_eq!(bad_wb, 1);
-        assert_eq!(first_wb, Some((777, exp, got)));
-        // Verify dst still received exact inverted stream.
-        assert_eq!(verify_gen(&dst, base + 4096, 0, &inv).0, 0);
+    fn vec_lcg_avx2_matches_scalar_on_unaligned_and_odd_slices() {
+        let mut backing = vec![0u64; 523];
+        for start in 0..4usize {
+            for invert in [false, true] {
+                let sub = &mut backing[start..start + 517];
+                fill_vec_lcg_slice::<false>(sub, 13, 0x1234_5678, 0x7777_7777, 0x3333_3333, invert);
+                for (i, &w) in sub.iter().enumerate() {
+                    let exp = vec_lcg_word(0x1234_5678, 0x7777_7777, 0x3333_3333, 13 + i, invert);
+                    assert_eq!(w, exp, "start={start} invert={invert} i={i}");
+                }
+                assert_eq!(
+                    verify_vec_lcg_slice(sub, 13, 0x1234_5678, 0x7777_7777, 0x3333_3333, invert).0,
+                    0
+                );
+            }
+        }
+    }
 
-        // 2) Verify cross-chunk mirror verifier catches a single bit flip and invokes on_error immediately.
+    #[test]
+    fn scatter_rmw_and_mirror_detect_single_bit_fault_with_zero_cascade() {
+        // 1) 64B Cached & NT pair scatter RMW detect a single flipped bit and write clean !pat.
+        for use_wb in [true, false] {
+            let mut buf = vec![0u64; 4099];
+            fill_pair_cached(&mut buf, 0, u64::MAX);
+            buf[2117] ^= 1u64 << 21;
+            let mut res = StepResult::default();
+            let caught = RefCell::new(Vec::new());
+            let ok = if use_wb {
+                scatter_pair_rmw_chunk::<true>(
+                    0,
+                    &mut buf,
+                    CACHELINE_WORDS,
+                    0,
+                    u64::MAX,
+                    13,
+                    false,
+                    &mut res,
+                    &|| true,
+                    &|_| {},
+                    &|n, mm| caught.borrow_mut().push((n, mm)),
+                )
+            } else {
+                scatter_pair_rmw_chunk::<false>(
+                    0,
+                    &mut buf,
+                    CACHELINE_WORDS,
+                    0,
+                    u64::MAX,
+                    13,
+                    false,
+                    &mut res,
+                    &|| true,
+                    &|_| {},
+                    &|n, mm| caught.borrow_mut().push((n, mm)),
+                )
+            };
+            assert!(ok);
+            assert_eq!(res.bad_words, 1);
+            let mm = caught.borrow()[0].1;
+            assert_eq!(mm.word_idx, 2117);
+            assert_eq!(mm.expected ^ mm.actual, 1u64 << 21);
+            // Zero-cascade invariant: subsequent pass verifies clean without repeating the old fault.
+            assert_eq!(verify_pair(&buf, u64::MAX, 0, 0).0, 0);
+        }
+
+        // 2) 64B Vector-LCG scatter RMW catches a single flipped bit and writes clean !lcg.
+        let mut lbuf = vec![0u64; 4103];
+        fill_vec_lcg_slice::<true>(&mut lbuf, 0, 0xCAFE_1234, 0x7777_7777, 0x3333_3333, false);
+        lbuf[1907] ^= 1u64 << 23;
+        let mut lres = StepResult::default();
+        let lcaught = RefCell::new(Vec::new());
+        assert!(scatter_vec_lcg_rmw_chunk::<true>(
+            2,
+            &mut lbuf,
+            CACHELINE_WORDS,
+            0xCAFE_1234,
+            0x7777_7777,
+            0x3333_3333,
+            false,
+            17,
+            false,
+            &mut lres,
+            &|| true,
+            &|_| {},
+            &|n, mm| lcaught.borrow_mut().push((n, mm)),
+        ));
+        assert_eq!(lres.bad_words, 1);
+        let lmm = lcaught.borrow()[0].1;
+        assert_eq!(lmm.chunk_idx, 2);
+        assert_eq!(lmm.word_idx, 1907);
+        assert_eq!(lmm.expected ^ lmm.actual, 1u64 << 23);
+        assert_eq!(
+            verify_vec_lcg_slice(&lbuf, 0, 0xCAFE_1234, 0x7777_7777, 0x3333_3333, true).0,
+            0
+        );
+
+        // 3) Cross-chunk coprime mirror verifier catches a single bit flip and invokes on_error immediately.
         let tag = |g: u64| absolut_tag(0xCAFE_BABE, g);
         let mut chunks = vec![(vec![0u64; 2048], 0u64), (vec![0u64; 2048], 2048u64)];
         for (c, s) in &mut chunks {
             nt_fill_gen_nofence(c, *s, &tag);
         }
         sfence_if_x86();
-        assert!(cross_chunk_nt_mirror(
+        assert!(cross_chunk_mirror::<true>(
             &mut chunks,
             16,
             None,
+            13,
             &|| true,
             &|_| {}
         ));

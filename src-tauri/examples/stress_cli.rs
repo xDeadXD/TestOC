@@ -11,9 +11,34 @@ use std::time::{Duration, Instant};
 
 use testoc_lib::model::*;
 use testoc_lib::stress::gpu::GpuStress;
-use testoc_lib::stress::manager::{NullEvents, StartContext, StressManager};
+use testoc_lib::stress::manager::{StartContext, StressEvents, StressManager};
 use testoc_lib::stress::safety;
 use testoc_lib::telemetry::TelemetryEngine;
+
+struct CliEvents {
+    started: Instant,
+}
+impl StressEvents for CliEvents {
+    fn status(&self, _: &StressStatus) {}
+    fn worker_error(&self, e: &WorkerError) {
+        println!(
+            "  [ERROR t={:.2}s] W{} {:?}: {}",
+            self.started.elapsed().as_secs_f64(),
+            e.worker_id,
+            e.kind,
+            e.detail
+        );
+    }
+    fn alert(&self, a: &SafetyAlert) {
+        println!(
+            "  [ALERT t={:.2}s] {:?} {:?}: {}",
+            self.started.elapsed().as_secs_f64(),
+            a.level,
+            a.metric,
+            a.message
+        );
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -24,6 +49,7 @@ fn main() {
     let mut mem_profile = MemoryProfile::Absolut;
     let mut cycles: Option<u16> = None;
     let mut adaptive = false;
+    let mut allow_errors = false;
     let mut pattern = MemoryPattern::All;
     let mut secs = 10u32;
     let mut poll_ms = 1000u64;
@@ -79,6 +105,9 @@ fn main() {
             "--adaptive" => {
                 adaptive = true;
             }
+            "--allow-errors" => {
+                allow_errors = true;
+            }
             "--pattern" => {
                 i += 1;
                 pattern = match args[i].as_str() {
@@ -114,7 +143,12 @@ fn main() {
         gpu.as_ref().map(|g| g.adapter_name().to_string()),
         gpu.as_ref().map(|g| g.fallback_vram_bytes()),
     );
-    let mgr = StressManager::new(Arc::new(NullEvents), gpu);
+    let mgr = StressManager::new(
+        Arc::new(CliEvents {
+            started: Instant::now(),
+        }),
+        gpu,
+    );
     let snap0 = engine.poll(None, SidecarState::NotStarted, mgr.snapshot());
     let (total_mem, avail_mem) = testoc_lib::win::memory_status()
         .unwrap_or((snap0.memory.total_bytes, snap0.memory.available_bytes));
@@ -366,6 +400,8 @@ fn main() {
         final_st.phase,
         final_st.message
     );
-    assert_eq!(final_st.total_errors, 0, "unexpected hardware errors");
+    if !allow_errors {
+        assert_eq!(final_st.total_errors, 0, "unexpected hardware errors");
+    }
     println!("STRESS_CLI PASS ({mode})");
 }

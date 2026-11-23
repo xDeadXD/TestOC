@@ -1659,12 +1659,12 @@ fn mem_worker(
         if worker == 0 {
             win::hint_working_set_bytes(shared.mem_allocated.load(Ordering::Relaxed));
         }
-        for wave in 0..2 {
+        for wave in 0..4 {
             if !shared.should_continue() {
                 break;
             }
             sleep_check(
-                Duration::from_millis(if wave == 0 { 40 } else { 30 }),
+                Duration::from_millis(if wave == 0 { 35 } else { 25 }),
                 &shared,
             );
             let (added, _) = reclaim_free_ram(&shared, &coord, &mut alloc, 64);
